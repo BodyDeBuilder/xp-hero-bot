@@ -1,0 +1,9 @@
+mss
+opencv-python
+ultralytics
+easyocr
+PyAutoGUI
+pure-python-adb
+PyQt6
+APScheduler
+pathfinding
