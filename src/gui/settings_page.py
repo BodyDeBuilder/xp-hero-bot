@@ -1175,7 +1175,7 @@ class SettingsPage(QWidget):
 
         brush_label = QLabel("Радиус кисти:")
         self.rec_brush_spin = QSpinBox()
-        self.rec_brush_spin.setRange(1, 100)
+        self.rec_brush_spin.setRange(0, 100)
         self.rec_brush_spin.setValue(self.settings_obj.value("rec_brush_radius", 4, type=int))
         self.rec_brush_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244;")
         self.rec_brush_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("rec_brush_radius", v))
@@ -1277,8 +1277,14 @@ class SettingsPage(QWidget):
         del_map_btn.setStyleSheet("background-color: #f38ba8; color: #11111b; border-radius: 4px; padding: 6px; font-weight: bold;")
         del_map_btn.clicked.connect(self.delete_map)
         
+        refresh_map_btn = QPushButton("🔄 Обновить")
+        refresh_map_btn.setStyleSheet("background-color: #89dceb; color: #11111b; border-radius: 4px; padding: 6px; font-weight: bold;")
+        refresh_map_btn.setToolTip("Обновить превью из файла (если вы редактировали его вручную)")
+        refresh_map_btn.clicked.connect(self.on_map_selected)
+        
         maps_btns_layout.addWidget(add_map_btn)
         maps_btns_layout.addWidget(del_map_btn)
+        maps_btns_layout.addWidget(refresh_map_btn)
         maps_btns_layout.addStretch()
         
         # Превью карты
@@ -1313,8 +1319,43 @@ class SettingsPage(QWidget):
         test_move_layout.addWidget(test_move_label)
         test_move_layout.addWidget(self.test_coords_input)
         test_move_layout.addWidget(test_run_btn)
+
+        # Смещение карты (Коррекция центрирования)
+        shift_label = QLabel("Коррекция центрирования")
+        shift_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-top: 20px;")
+
+        was_layout = QHBoxLayout()
+        was_title = QLabel("Было:")
+        self.shift_was_val = QLabel("0, 0")
+        self.shift_was_val.setStyleSheet("color: #fab387; font-weight: bold;")
+        was_layout.addWidget(was_title)
+        was_layout.addWidget(self.shift_was_val)
+        was_layout.addStretch()
+
+        become_layout = QHBoxLayout()
+        become_title = QLabel("Стало:")
+        self.shift_x_spin = QSpinBox()
+        self.shift_y_spin = QSpinBox()
+        for sb in [self.shift_x_spin, self.shift_y_spin]:
+            sb.setRange(-2000, 2000)
+            sb.setStyleSheet("background-color: #1e1e2e; color: #cdd6f4; padding: 5px;")
+
+        become_layout.addWidget(become_title)
+        become_layout.addWidget(QLabel("X:"))
+        become_layout.addWidget(self.shift_x_spin)
+        become_layout.addWidget(QLabel("Y:"))
+        become_layout.addWidget(self.shift_y_spin)
+
+        self.shift_btn = QPushButton("Сместить пути")
+        self.shift_btn.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; padding: 8px; margin-top: 10px;")
+        self.shift_btn.clicked.connect(self.shift_map_paths)
+
+        test_move_layout.addWidget(shift_label)
+        test_move_layout.addLayout(was_layout)
+        test_move_layout.addLayout(become_layout)
+        test_move_layout.addWidget(self.shift_btn)
+
         test_move_layout.addStretch()
-        
         maps_mgr_layout.addWidget(self.maps_list_widget)
         maps_mgr_layout.addLayout(maps_btns_layout)
         maps_mgr_layout.addLayout(preview_layout)
@@ -2164,6 +2205,14 @@ class SettingsPage(QWidget):
                 # 1. Загружаем регион
                 with open(region_info_path, "r") as f:
                     region = json.load(f)
+                
+                # Показываем старые офсеты в интерфейсе
+                ox = region.get("offset_x", 0)
+                oy = region.get("offset_y", 0)
+                self.shift_was_val.setText(f"{ox}, {oy}")
+                # Сразу ставим их в поля "Стало" для удобной правки
+                self.shift_x_spin.setValue(ox)
+                self.shift_y_spin.setValue(oy)
                 print(f"DEBUG: Region loaded: {region}")
                 
                 # 2. Загружаем глобальную карту
@@ -2223,6 +2272,78 @@ class SettingsPage(QWidget):
         self.map_preview_label.setText("Нет данных проходимости.\nЗапишите маршрут.")
         self.open_editor_btn.hide()
             
+    def shift_map_paths(self):
+        curr_item = self.maps_list_widget.currentItem()
+        if not curr_item:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите карту в списке!")
+            return
+            
+        name = curr_item.text()
+        map_dir = os.path.join(ASSETS_DIR, "maps", name)
+        walkability_path = os.path.join(map_dir, "walkability.png")
+        region_info_path = os.path.join(map_dir, "region.json")
+        
+        if not os.path.exists(walkability_path) or not os.path.exists(region_info_path):
+            QMessageBox.warning(self, "Ошибка", "Данные карты не найдены!")
+            return
+
+        try:
+            # 1. Загружаем старые данные
+            with open(region_info_path, "r") as f:
+                region = json.load(f)
+            
+            old_ox = region.get("offset_x", 0)
+            old_oy = region.get("offset_y", 0)
+            
+            # 2. Получаем новые данные из полей ввода
+            new_ox = self.shift_x_spin.value()
+            new_oy = self.shift_y_spin.value()
+            
+            if old_ox == new_ox and old_oy == new_oy:
+                QMessageBox.information(self, "Инфо", "Координаты не изменились. Смещение не требуется.")
+                return
+                
+            # 3. Вычисляем разницу в ЛОГИЧЕСКИХ пикселях
+            # Если новый офсет больше старого (сдвинули центр вправо/вниз), 
+            # то нарисованные ПУТИ на картинке должны сдвинуться в ту же сторону.
+            dx_logical = new_ox - old_ox
+            dy_logical = new_oy - old_oy
+            
+            # 4. Переводим в ФИЗИЧЕСКИЕ пиксели (для картинки)
+            screen = QApplication.primaryScreen()
+            scale = screen.devicePixelRatio() if screen else 1.0
+            dx_phys = float(dx_logical * scale)
+            dy_phys = float(dy_logical * scale)
+            
+            # 5. Загружаем и сдвигаем картинку
+            with open(walkability_path, "rb") as f:
+                chunk = np.frombuffer(f.read(), dtype=np.uint8)
+                img = cv2.imdecode(chunk, cv2.IMREAD_COLOR)
+            
+            if img is not None:
+                # Матрица афинного преобразования для сдвига
+                M = np.float32([[1, 0, dx_phys], [0, 1, dy_phys]])
+                shifted_img = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
+                
+                # 6. Сохраняем результат
+                is_success, buffer = cv2.imencode(".png", shifted_img)
+                if is_success:
+                    with open(walkability_path, "wb") as f:
+                        f.write(buffer)
+                
+                # 7. Обновляем region.json новыми офсетами
+                region["offset_x"] = new_ox
+                region["offset_y"] = new_oy
+                with open(region_info_path, "w") as f:
+                    json.dump(region, f)
+                
+                # 8. Обновляем UI
+                self.on_map_selected()
+                QMessageBox.information(self, "Успех", f"Пути успешно смещены на ({dx_logical}, {dy_logical}) пикселей.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сместить пути: {e}")
+
     def open_map_editor(self):
         curr_item = self.maps_list_widget.currentItem()
         if curr_item:
@@ -2397,8 +2518,15 @@ class SettingsPage(QWidget):
                             with open(walkability_path, "wb") as f:
                                 f.write(bw_buffer)
                     
-                    # 3. Сохраняем координаты региона в JSON (для вырезания при превью и навигации)
-                    region_data = {"x": x, "y": y, "w": w, "h": h, "screen_w": img_rgb.shape[1], "screen_h": img_rgb.shape[0]}
+                    # 3. Сохраняем координаты региона и офсеты в JSON
+                    ox = self.interactive_map.original_x if hasattr(self, 'interactive_map') else 0
+                    oy = self.interactive_map.original_y if hasattr(self, 'interactive_map') else 0
+                    
+                    region_data = {
+                        "x": x, "y": y, "w": w, "h": h, 
+                        "screen_w": img_rgb.shape[1], "screen_h": img_rgb.shape[0],
+                        "offset_x": ox, "offset_y": oy
+                    }
                     with open(region_info_path, "w") as f:
                         json.dump(region_data, f)
                     

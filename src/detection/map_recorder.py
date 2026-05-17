@@ -156,12 +156,22 @@ class MapRecorder(QThread):
                         paint_color = "black" if self.is_reverse else "white"
 
                         try:
+                            # Вычисляем толщину линии: 
+                            # Если радиус 0 -> ширина 1
+                            # Если радиус 1 -> ширина 3 (центр + 1 с каждой стороны)
+                            # Учитываем DPI (scale)
+                            line_width = int((self.brush_radius * 2 + 1) * scale)
+                            if line_width < 1: line_width = 1
+                            
+                            # Для круга (закраска точки)
+                            r_phys = int(self.brush_radius * scale)
+                            
                             if self.last_pos is not None:
-                                self.walkability_draw.line([self.last_pos, current_pos], fill=paint_color, width=int(radius * scale * 2))
+                                self.walkability_draw.line([self.last_pos, current_pos], fill=paint_color, width=line_width)
                             
                             self.walkability_draw.ellipse(
-                                (current_pos[0] - int(radius*scale), current_pos[1] - int(radius*scale), 
-                                 current_pos[0] + int(radius*scale), current_pos[1] + int(radius*scale)), 
+                                (current_pos[0] - r_phys, current_pos[1] - r_phys, 
+                                 current_pos[0] + r_phys, current_pos[1] + r_phys), 
                                 fill=paint_color
                             )
                         except Exception: pass
