@@ -34,29 +34,33 @@ class PathFinder:
 
             # 3. Вырезаем рабочий кусок (если есть инфо о регионе)
             if self.region:
-                x, y, w, h = int(self.region["x"]), int(self.region["y"]), int(self.region["w"]), int(self.region["h"])
-                y2, x2 = min(full_img.shape[0], y+h), min(full_img.shape[1], x+w)
-                img = full_img[y:y2, x:x2]
+                scale = self.region.get("scale", 1.0)
+                px = int(self.region["x"] * scale)
+                py = int(self.region["y"] * scale)
+                pw = int(self.region["w"] * scale)
+                ph = int(self.region["h"] * scale)
+                
+                y2, x2 = min(full_img.shape[0], py+ph), min(full_img.shape[1], px+pw)
+                img = full_img[py:y2, px:x2]
             else:
                 img = full_img
 
         except Exception as e:
             raise Exception(f"Ошибка при подготовке карты: {e}")
 
-        # Дальнейшая логика остается прежней (инверсия и раздутие)
+        # Инвертируем, чтобы стены были 255, а дороги 0
         _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
 
         if self.wall_offset > 0:
-            # Раздуваем препятствия (стены) на заданное кол-во пикселей
+            # Раздуваем препятствия (стены)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.wall_offset * 2 + 1, self.wall_offset * 2 + 1))
             binary = cv2.dilate(binary, kernel)
 
-        # Возвращаем обратно: дороги - True (1), стены - False (0)
+        # Переводим в Grid: True - проходимо (дорога), False - стена
         self.grid = (binary == 0)
         self.height, self.width = self.grid.shape
 
     def find_nearest_walkable(self, node):
-        """Ищет ближайшую свободную точку в радиусе 20 пикселей."""
         r, c = node
         best_node = None
         min_dist = float('inf')
@@ -73,95 +77,84 @@ class PathFinder:
                             best_node = (nr, nc)
         return best_node
 
-    def get_path(self, start, end):
+    def get_path(self, start_logical, end_logical):
         """
-        Ищет путь от start (x,y) до end (x,y).
-        Координаты логические (пиксели на карте).
-        Возвращает список точек [(x1,y1), (x2,y2)...] или None
+        Ищет путь. 
+        Координаты логические (пиксели региона).
+        Возвращает список логических точек [(x,y)...]
         """
-        start_node = (int(start[1]), int(start[0])) # (row, col)
-        end_node = (int(end[1]), int(end[0]))
-
-        print(f"DEBUG PathFinder: Ищем путь от {start_node} до {end_node}")
-
-        # Проверка границ
-        if not (0 <= start_node[0] < self.height and 0 <= start_node[1] < self.width):
-            print(f"DEBUG PathFinder: Старт {start_node} вне границ карты ({self.height}x{self.width})")
-            return None
-        if not (0 <= end_node[0] < self.height and 0 <= end_node[1] < self.width):
-            print(f"DEBUG PathFinder: Цель {end_node} вне границ карты")
-            return None
+        if self.grid is None: return None
         
-        # Если старт или цель в стене (из-за wall_offset), ищем ближайшую точку
-        if not self.grid[start_node]:
-            print(f"DEBUG PathFinder: Старт {start_node} находится в стене (раздутой). Ищем замену...")
-            new_start = self.find_nearest_walkable(start_node)
-            if new_start:
-                print(f"DEBUG PathFinder: Старт заменен на {new_start}")
-                start_node = new_start
-            else:
-                print("DEBUG PathFinder: Не удалось найти свободную точку рядом со стартом.")
-                return None
-
-        if not self.grid[end_node]:
-            print(f"DEBUG PathFinder: Цель {end_node} находится в стене. Ищем замену...")
-            new_end = self.find_nearest_walkable(end_node)
-            if new_end:
-                print(f"DEBUG PathFinder: Цель заменена на {new_end}")
-                end_node = new_end
-            else:
-                print("DEBUG PathFinder: Не удалось найти свободную точку рядом с целью.")
-                return None
-
-        # Алгоритм A*
-        queue = [(0, start_node)]
-        came_from = {}
-        cost_so_far = {start_node: 0}
+        scale = self.region.get("scale", 1.0) if self.region else 1.0
         
-        # 8 направлений движения
-        neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+        # 1. Переводим ЛОГИЧЕСКИЕ в ФИЗИЧЕСКИЕ (сетка)
+        start_phys = (int(start_logical[1] * scale), int(start_logical[0] * scale)) # (row, col)
+        end_phys = (int(end_logical[1] * scale), int(end_logical[0] * scale))
 
+        # 2. Проверка границ
+        if not (0 <= start_phys[0] < self.height and 0 <= start_phys[1] < self.width): return None
+        if not (0 <= end_phys[0] < self.height and 0 <= end_phys[1] < self.width): return None
+        
+        # 3. Если старт в стене (раздутой), ищем замену
+        if not self.grid[start_phys]:
+            start_phys = self.find_nearest_walkable(start_phys)
+            if not start_phys: return None
+
+        # 4. A* на физической сетке
+        queue = [(0, start_phys)]
+        came_from = {start_phys: None}
+        cost_so_far = {start_phys: 0}
+        
         while queue:
-            current_priority, current = heapq.heappop(queue)
-
-            if current == end_node:
-                break
-
-            for dx, dy in neighbors:
-                next_node = (current[0] + dx, current[1] + dy)
+            _, current = heapq.heappop(queue)
+            if current == end_phys: break
                 
-                # Проверка проходимости
-                if 0 <= next_node[0] < self.height and 0 <= next_node[1] < self.width:
-                    if not self.grid[next_node]:
-                        continue
-                    
-                    # Стоимость шага (диагональ чуть дороже)
-                    new_cost = cost_so_far[current] + (1.41 if dx != 0 and dy != 0 else 1)
-                    
-                    if next_node not in cost_so_far or new_cost < cost_so_far[next_node]:
-                        cost_so_far[next_node] = new_cost
-                        # Эвристика: Манхэттенское расстояние или Евклидово
-                        priority = new_cost + self.heuristic(next_node, end_node)
-                        heapq.heappush(queue, (priority, next_node))
-                        came_from[next_node] = current
-
-        if end_node not in came_from:
-            return None
-
-        # Восстановление пути
-        path = []
-        curr = end_node
-        while curr != start_node:
-            path.append((curr[1], curr[0])) # Обратно в (x, y)
-            curr = came_from[curr]
-        path.reverse()
-        
-        # Сглаживание пути (упрощенно: берем каждую 3-5 точку, чтобы не дергать мышь на каждый пиксель)
-        smoothed_path = path[::5]
-        if not smoothed_path or smoothed_path[-1] != path[-1]:
-            smoothed_path.append(path[-1])
+            for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                neighbor = (current[0] + dy, current[1] + dx)
+                if 0 <= neighbor[0] < self.height and 0 <= neighbor[1] < self.width:
+                    if self.grid[neighbor]:
+                        new_cost = cost_so_far[current] + (1.41 if dx!=0 and dy!=0 else 1)
+                        if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                            cost_so_far[neighbor] = new_cost
+                            priority = new_cost + self.heuristic(neighbor, end_phys)
+                            heapq.heappush(queue, (priority, neighbor))
+                            came_from[neighbor] = current
+                            
+        if end_phys not in came_from: return None
             
-        return smoothed_path
+        # 5. Восстановление пути (физического)
+        path_phys = []
+        curr = end_phys
+        while curr is not None:
+            path_phys.append(curr)
+            curr = came_from[curr]
+        path_phys.reverse()
+        
+        # 6. Сглаживание и перевод в ЛОГИЧЕСКИЕ для бота
+        smoothed = self.smooth_path(path_phys)
+        return [(p[1] / scale, p[0] / scale) for p in smoothed]
 
     def heuristic(self, a, b):
         return np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+    def smooth_path(self, path):
+        if len(path) <= 2: return path
+        smoothed = [path[0]]
+        for i in range(1, len(path) - 1):
+            p1, p2, p3 = smoothed[-1], path[i], path[i+1]
+            if not self.is_line_clear(p1, p3):
+                smoothed.append(p2)
+        smoothed.append(path[-1])
+        return smoothed
+
+    def is_line_clear(self, p1, p2):
+        # row, col
+        r1, c1 = p1
+        r2, c2 = p2
+        points = 15
+        for i in range(points + 1):
+            r = int(r1 + (r2 - r1) * i / points)
+            c = int(c1 + (c2 - c1) * i / points)
+            if not (0 <= r < self.height and 0 <= c < self.width) or not self.grid[r, c]:
+                return False
+        return True

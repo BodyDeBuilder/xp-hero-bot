@@ -161,6 +161,7 @@ class CoordTableWidget(QTableWidget):
 
 class TestMoveThread(QThread):
     finished = Signal()
+    error_occurred = Signal(str)
 
     def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset):
         super().__init__()
@@ -186,24 +187,27 @@ class TestMoveThread(QThread):
                 finder = PathFinder(self.map_path, self.wall_offset)
             except Exception as e:
                 print(f"DEBUG: Ошибка навигатора: {e}")
+                self.error_occurred.emit(f"Ошибка навигатора: {e}")
                 return
 
             # Даем окну бота время полностью скрыться
             time.sleep(1.5)
             
             # 2. Активация окна (клик в центр джойстика)
-            phys_joy_x = int(self.joy_settings['x'] * self.scale)
-            phys_joy_y = int(self.joy_settings['y'] * self.scale)
-            
-            print(f"DEBUG: Активация окна кликом в ({phys_joy_x}, {phys_joy_y})")
-            pyautogui.click(phys_joy_x, phys_joy_y)
+            # ВАЖНО: pyautogui работает в ЛОГИЧЕСКИХ координатах
+            log_joy_x = int(self.joy_settings['x'])
+            log_joy_y = int(self.joy_settings['y'])
+
+            print(f"DEBUG NAV: Clicking joystick at logical ({log_joy_x}, {log_joy_y})")
+            pyautogui.click(log_joy_x, log_joy_y)
             time.sleep(0.8)
-            
+
             # Загружаем маркер
             mark_img_full = cv2.imread(self.marker_path, cv2.IMREAD_UNCHANGED)
-            if mark_img_full is None: return
-            
-            # СТРОГОЕ ПРИВЕДЕНИЕ ТИПОВ
+            if mark_img_full is None: 
+                self.error_occurred.emit("Не удалось загрузить маркер (mark.png)")
+                return
+
             if len(mark_img_full.shape) == 4:
                 template = cv2.cvtColor(mark_img_full, cv2.COLOR_BGRA2BGR).astype(np.uint8)
                 alpha = mark_img_full[:, :, 3]
@@ -211,22 +215,20 @@ class TestMoveThread(QThread):
                 mask = mask.astype(np.uint8)
             else:
                 template = mark_img_full.astype(np.uint8)
-                if len(template.shape) == 3 and template.shape[2] == 4:
-                    template = cv2.cvtColor(template, cv2.COLOR_BGRA2BGR)
                 mask = None
 
             marker_h, marker_w = template.shape[:2]
             
             # 3. Цикл движения по маршруту
             start_time = time.time()
-            max_duration = 30.0 # Увеличим время для сложного пути
-            
-            print("DEBUG: Начинаем навигацию...")
-            pyautogui.mouseDown(phys_joy_x, phys_joy_y)
-            
+            max_duration = 30.0
+
+            print("DEBUG NAV: Starting movement loop...")
+            pyautogui.mouseDown(log_joy_x, log_joy_y)
+
             path = []
             path_index = 0
-            
+
             with mss.mss() as sct:
                 phys_region = {
                     "top": int(self.region["top"] * self.scale),
@@ -237,75 +239,71 @@ class TestMoveThread(QThread):
 
                 while time.time() - start_time < max_duration:
                     if not self.isRunning(): break
-                    
-                    # Детекция
+
                     sct_img = sct.grab(phys_region)
-                    # Превращаем скриншот в uint8 BGR
                     img_np = np.array(sct_img, dtype=np.uint8)
                     img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR).astype(np.uint8)
-                    
+
                     if mask is not None:
                         res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCORR_NORMED, mask=mask)
                     else:
                         res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCORR_NORMED)
-                    
-                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                    
-                    if max_val >= self.threshold:
-                        # Логические координаты персонажа
-                        found_x_map = max_loc[0] / self.scale
-                        found_y_map = max_loc[1] / self.scale
-                        
-                        if self.centering_enabled:
-                            cur_x = self.region["left"] + found_x_map + self.centering_offset[0]
-                            cur_y = self.region["top"] + found_y_map + self.centering_offset[1]
-                        else:
-                            cur_x = self.region["left"] + found_x_map + (marker_w / self.scale) / 2
-                            cur_y = self.region["top"] + found_y_map + (marker_h / self.scale) / 2
-                        
-                        # Координаты относительно начала миникарты для A*
-                        rel_x = cur_x - self.region["left"]
-                        rel_y = cur_y - self.region["top"]
-                        
-                        target_rel_x = self.target_pos[0] - self.region["left"]
-                        target_rel_y = self.target_pos[1] - self.region["top"]
 
-                        # Если пути еще нет - строим его!
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+                    if max_val >= self.threshold:
+                        # Логические координаты ПЕРЕДНЕГО ВЕРХНЕГО УГЛА МАРКЕРА относительно захваченного региона
+                        found_x_rel_log = max_loc[0] / self.scale
+                        found_y_rel_log = max_loc[1] / self.scale
+
+                        # Координаты ног персонажа относительно региона (ЛОГИЧЕСКИЕ)
+                        if self.centering_enabled:
+                            rel_x = found_x_rel_log + (self.centering_offset[0] / self.scale)
+                            rel_y = found_y_rel_log + (self.centering_offset[1] / self.scale)
+                        else:
+                            rel_x = found_x_rel_log + (marker_w / self.scale) / 2
+                            rel_y = found_y_rel_log + (marker_h / self.scale) / 2
+
+                        print(f"DEBUG NAV: Character at RegionLog({int(rel_x)}, {int(rel_y)})")
+
+                        # Определяем цель
+                        if self.target_pos[0] > self.region["width"]:
+                            target_rel_x = self.target_pos[0] - self.region["left"]
+                            target_rel_y = self.target_pos[1] - self.region["top"]
+                        else:
+                            target_rel_x = self.target_pos[0]
+                            target_rel_y = self.target_pos[1]
+
                         if not path:
-                            print(f"DEBUG: Строим маршрут от ({int(rel_x)}, {int(rel_y)}) до ({int(target_rel_x)}, {int(target_rel_y)})")
+                            print(f"DEBUG NAV: Planning path from ({int(rel_x)}, {int(rel_y)}) to ({int(target_rel_x)}, {int(target_rel_y)})")
                             path = finder.get_path((rel_x, rel_y), (target_rel_x, target_rel_y))
                             if not path:
-                                print("DEBUG: Путь не найден! Препятствие непреодолимо.")
+                                self.error_occurred.emit("Путь не найден! Убедитесь, что вы и цель стоите на белых маршрутах.")
                                 break
-                            print(f"DEBUG: Маршрут построен, точек: {len(path)}")
                             path_index = 0
 
                         # Проверяем расстояние до финальной цели
                         final_dist = math.sqrt((target_rel_x - rel_x)**2 + (target_rel_y - rel_y)**2)
                         if final_dist < self.target_tolerance:
-                            print(f"DEBUG: Финальная цель достигнута! Дистанция: {final_dist:.1f}")
                             break
-                            
-                        # Берем текущую путевую точку
+
                         if path_index < len(path):
                             waypoint = path[path_index]
                             wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
-                            
-                            # Если подошли к точке - переходим к следующей
+
                             if wp_dist < 5 and path_index < len(path) - 1:
                                 path_index += 1
                                 waypoint = path[path_index]
-                                
-                            # Вычисляем угол к точке
+
                             dx = waypoint[0] - rel_x
                             dy = waypoint[1] - rel_y
                             angle = math.atan2(dy, dx)
-                            
-                            drag_x = self.joy_settings['x'] + math.cos(angle) * self.joy_settings['radius']
-                            drag_y = self.joy_settings['y'] + math.sin(angle) * self.joy_settings['radius']
-                            
-                            pyautogui.moveTo(int(drag_x * self.scale), int(drag_y * self.scale), duration=0.05)
-                    
+
+                            # Тянем джойстик (в логических координатах)
+                            drag_x = log_joy_x + math.cos(angle) * self.joy_settings['radius']
+                            drag_y = log_joy_y + math.sin(angle) * self.joy_settings['radius']
+
+                            pyautogui.moveTo(int(drag_x), int(drag_y), duration=0.05)
                     time.sleep(self.scan_interval)
 
             pyautogui.mouseUp()
@@ -2409,10 +2407,7 @@ class SettingsPage(QWidget):
             target_pos, joy_settings, region, scale, marker_path, threshold,
             self.cb_enable_centering.isChecked(),
             (self.interactive_map.original_x, self.interactive_map.original_y),
-            scan_interval,
-            target_tolerance,
-            map_path,
-            wall_offset
+            scan_interval, target_tolerance, map_path, wall_offset
         )
         
         def on_move_finished():
@@ -2420,7 +2415,11 @@ class SettingsPage(QWidget):
             self.main_window.raise_()
             self.main_window.activateWindow()
             
+        def on_move_error(msg):
+            QMessageBox.warning(self, "Ошибка навигации", msg)
+            
         self.move_thread.finished.connect(on_move_finished)
+        self.move_thread.error_occurred.connect(on_move_error)
         self.move_thread.start()
 
     def find_joystick_settings(self):
@@ -2525,6 +2524,7 @@ class SettingsPage(QWidget):
                     region_data = {
                         "x": x, "y": y, "w": w, "h": h, 
                         "screen_w": img_rgb.shape[1], "screen_h": img_rgb.shape[0],
+                        "scale": scale,
                         "offset_x": ox, "offset_y": oy
                     }
                     with open(region_info_path, "w") as f:
