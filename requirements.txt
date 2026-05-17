@@ -7,3 +7,4 @@ pure-python-adb
 PyQt6
 APScheduler
 pathfinding
+pywin32
