@@ -16,6 +16,7 @@ import numpy as np
 import pyautogui
 import re
 import math
+import shutil
 
 from src.detection.map_recorder import MapRecorder
 from src.tools.navigation import PathFinder
@@ -2125,9 +2126,19 @@ class SettingsPage(QWidget):
         curr_item = self.maps_list_widget.currentItem()
         if curr_item:
             name = curr_item.text()
-            reply = QMessageBox.question(self, "Удаление", f"Удалить карту '{name}'?", 
+            reply = QMessageBox.question(self, "Удаление", f"Удалить карту '{name}' и ВСЕ её файлы?", 
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
+                # 1. Удаляем папку физически
+                map_dir = os.path.join(ASSETS_DIR, "maps", name)
+                if os.path.exists(map_dir):
+                    try:
+                        shutil.rmtree(map_dir)
+                        print(f"DEBUG: Папка {map_dir} удалена")
+                    except Exception as e:
+                        QMessageBox.warning(self, "Ошибка удаления", f"Не удалось удалить папку {name}: {e}")
+
+                # 2. Удаляем из настроек
                 self.maps.remove(name)
                 self.settings_obj.setValue("maps_list", json.dumps(self.maps))
                 self.load_maps_list()
@@ -2140,16 +2151,77 @@ class SettingsPage(QWidget):
             return
             
         name = curr_item.text()
-        map_path = os.path.join(ASSETS_DIR, "maps", name, "walkability.png")
-        if os.path.exists(map_path):
-            pixmap = QPixmap(map_path)
-            # Масштабируем, сохраняя пропорции
-            scaled_pixmap = pixmap.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            self.map_preview_label.setPixmap(scaled_pixmap)
-            self.open_editor_btn.show()
-        else:
-            self.map_preview_label.setText("Нет данных проходимости.\nЗапишите маршрут.")
-            self.open_editor_btn.hide()
+        map_dir = os.path.join(ASSETS_DIR, "maps", name)
+        walkability_path = os.path.join(map_dir, "walkability.png")
+        region_info_path = os.path.join(map_dir, "region.json")
+        
+        print(f"DEBUG: on_map_selected for '{name}'")
+        print(f"DEBUG: Path walkability: {os.path.exists(walkability_path)}")
+        print(f"DEBUG: Path region: {os.path.exists(region_info_path)}")
+
+        if os.path.exists(walkability_path) and os.path.exists(region_info_path):
+            try:
+                # 1. Загружаем регион
+                with open(region_info_path, "r") as f:
+                    region = json.load(f)
+                print(f"DEBUG: Region loaded: {region}")
+                
+                # 2. Загружаем глобальную карту
+                with open(walkability_path, "rb") as f:
+                    chunk = np.frombuffer(f.read(), dtype=np.uint8)
+                    full_map = cv2.imdecode(chunk, cv2.IMREAD_COLOR)
+                
+                if full_map is not None:
+                    print(f"DEBUG: Map loaded, size: {full_map.shape}")
+                    # Учитываем масштаб
+                    screen = QApplication.primaryScreen()
+                    scale = screen.devicePixelRatio() if screen else 1.0
+                    print(f"DEBUG: Current scale: {scale}")
+                    
+                    # 3. Переводим в физические пиксели
+                    px = int(region["x"] * scale)
+                    py = int(region["y"] * scale)
+                    pw = int(region["w"] * scale)
+                    ph = int(region["h"] * scale)
+                    print(f"DEBUG: Target crop phys: x={px}, y={py}, w={pw}, h={ph}")
+                    
+                    # Проверяем границы
+                    y2 = min(full_map.shape[0], py + ph)
+                    x2 = min(full_map.shape[1], px + pw)
+                    
+                    # Если масштаб 1.0 не сработал (например, картинка уже в логических), 
+                    # или если физические координаты выходят за рамки слишком сильно
+                    if px >= full_map.shape[1] or py >= full_map.shape[0]:
+                        print("DEBUG: Физические координаты вне картинки, пробуем логические...")
+                        px, py, pw, ph = region["x"], region["y"], region["w"], region["h"]
+                        y2 = min(full_map.shape[0], py + ph)
+                        x2 = min(full_map.shape[1], px + pw)
+
+                    cropped = full_map[py:y2, px:x2]
+                    print(f"DEBUG: Cropped size: {cropped.shape if cropped is not None else 'None'}")
+                    
+                    if cropped is not None and cropped.size > 0:
+                        # Конвертируем в QPixmap
+                        height, width, channel = cropped.shape
+                        bytesPerLine = 3 * width
+                        qImg = QImage(cropped.data.tobytes(), width, height, bytesPerLine, QImage.Format.Format_BGR888)
+                        pixmap = QPixmap.fromImage(qImg)
+                        
+                        if not pixmap.isNull():
+                            scaled_pixmap = pixmap.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                            self.map_preview_label.setPixmap(scaled_pixmap)
+                            self.open_editor_btn.show()
+                            print("DEBUG: Preview updated successfully")
+                            return
+                        else:
+                            print("DEBUG: Pixmap is null!")
+            except Exception as e:
+                print(f"DEBUG: Ошибка превью: {e}")
+                import traceback
+                traceback.print_exc()
+
+        self.map_preview_label.setText("Нет данных проходимости.\nЗапишите маршрут.")
+        self.open_editor_btn.hide()
             
     def open_map_editor(self):
         curr_item = self.maps_list_widget.currentItem()
@@ -2279,8 +2351,73 @@ class SettingsPage(QWidget):
         if hasattr(self, 'region_val_label'):
             self.region_val_label.setText(region_str)
         
+        time.sleep(0.1)
+        
+        map_name = ""
+        try:
+            curr_item = self.maps_list_widget.currentItem()
+            if curr_item:
+                map_name = curr_item.text()
+            elif hasattr(self, 'rec_map_combo') and self.rec_map_combo.currentText():
+                map_name = self.rec_map_combo.currentText()
+        except Exception as e:
+            print(f"DEBUG: Ошибка при получении имени карты: {e}")
+            
+        if map_name:
+            try:
+                screen = QApplication.primaryScreen()
+                scale = screen.devicePixelRatio() if screen else 1.0
+                
+                # Координаты всего экрана (первого монитора)
+                with mss.mss() as sct:
+                    monitor = sct.monitors[1] # Основной монитор
+                    full_sct = sct.grab(monitor)
+                    
+                    map_dir = os.path.join(ASSETS_DIR, "maps", map_name)
+                    os.makedirs(map_dir, exist_ok=True)
+                    
+                    original_map_path = os.path.join(map_dir, "map_original.png")
+                    walkability_path = os.path.join(map_dir, "walkability.png")
+                    region_info_path = os.path.join(map_dir, "region.json")
+                    
+                    # 1. Сохраняем ПОЛНЫЙ скриншот экрана как оригинал
+                    img_full = np.array(full_sct)
+                    img_rgb = cv2.cvtColor(img_full, cv2.COLOR_BGRA2BGR)
+                    
+                    is_success, buffer = cv2.imencode(".png", img_rgb)
+                    if is_success:
+                        with open(original_map_path, "wb") as f:
+                            f.write(buffer)
+                    
+                    # 2. Инициализируем walkability.png (Глобальный черный холст)
+                    if not os.path.exists(walkability_path):
+                        black_canvas = np.zeros((img_rgb.shape[0], img_rgb.shape[1], 3), dtype=np.uint8)
+                        is_success_bw, bw_buffer = cv2.imencode(".png", black_canvas)
+                        if is_success_bw:
+                            with open(walkability_path, "wb") as f:
+                                f.write(bw_buffer)
+                    
+                    # 3. Сохраняем координаты региона в JSON (для вырезания при превью и навигации)
+                    region_data = {"x": x, "y": y, "w": w, "h": h, "screen_w": img_rgb.shape[1], "screen_h": img_rgb.shape[0]}
+                    with open(region_info_path, "w") as f:
+                        json.dump(region_data, f)
+                    
+                    print(f"DEBUG: Global Canvas инициализирован для {map_name}")
+                    self.on_map_selected()
+            except Exception as e:
+                print(f"Ошибка Global Canvas: {e}")
+
         self.main_window.showNormal()
         self.main_window.activateWindow()
+        QMessageBox.information(self, "Успех", "Глобальная карта инициализирована. Регион сохранен.")
+
+        self.main_window.showNormal()
+        self.main_window.activateWindow()
+        
+        if map_name:
+            QMessageBox.information(self, "Успех", f"Регион задан. Старые маршруты перенесены.")
+        else:
+            QMessageBox.warning(self, "Инфо", "Регион сохранен.")
 
     def pick_char_color(self):
         current_hex = self.settings_obj.value("rec_char_color", "#00ff00", type=str)
@@ -2291,11 +2428,12 @@ class SettingsPage(QWidget):
             self.char_color_btn.setStyleSheet(f"background-color: {new_hex}; border-radius: 4px; border: 1px solid #313244;")
 
     def start_map_recording(self):
-        if self.rec_map_combo.count() == 0:
-            QMessageBox.warning(self, "Ошибка", "Нет карт для записи! Сначала создайте карту.")
+        curr_item = self.maps_list_widget.currentItem()
+        if not curr_item:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите карту в списке 'Менеджер карт'!")
             return
             
-        map_name = self.rec_map_combo.currentText()
+        map_name = curr_item.text()
         interval_ms = self.rec_interval_spin.value()
         brush_radius = self.rec_brush_spin.value()
         

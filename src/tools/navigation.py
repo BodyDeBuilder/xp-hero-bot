@@ -1,32 +1,49 @@
 import numpy as np
 import heapq
 import cv2
+import os
+import json
 
 class PathFinder:
     def __init__(self, walkability_map_path, wall_offset=5):
-        """
-        Инициализация навигатора.
-        walkability_map_path: путь к ЧБ файлу walkability.png
-        wall_offset: отступ от стен в пикселях (раздутие препятствий)
-        """
         self.map_path = walkability_map_path
         self.wall_offset = wall_offset
         self.grid = None
+        
+        # Для Global Canvas нам нужны координаты региона
+        self.map_dir = os.path.dirname(walkability_map_path)
+        self.region_info_path = os.path.join(self.map_dir, "region.json")
+        self.region = None
+        
         self.load_and_prepare_map()
 
     def load_and_prepare_map(self):
-        # Используем numpy для чтения файлов с кириллицей в пути
         try:
+            # 1. Загружаем регион (координаты выреза)
+            if os.path.exists(self.region_info_path):
+                with open(self.region_info_path, "r") as f:
+                    self.region = json.load(f)
+            
+            # 2. Загружаем ГЛОБАЛЬНУЮ карту
             with open(self.map_path, "rb") as f:
                 chunk = np.frombuffer(f.read(), dtype=np.uint8)
-                img = cv2.imdecode(chunk, cv2.IMREAD_GRAYSCALE)
+                full_img = cv2.imdecode(chunk, cv2.IMREAD_GRAYSCALE)
+            
+            if full_img is None:
+                raise Exception("Не удалось декодировать карту")
+
+            # 3. Вырезаем рабочий кусок (если есть инфо о регионе)
+            if self.region:
+                x, y, w, h = int(self.region["x"]), int(self.region["y"]), int(self.region["w"]), int(self.region["h"])
+                y2, x2 = min(full_img.shape[0], y+h), min(full_img.shape[1], x+w)
+                img = full_img[y:y2, x:x2]
+            else:
+                img = full_img
+
         except Exception as e:
-            raise Exception(f"Ошибка при чтении файла {self.map_path}: {e}")
+            raise Exception(f"Ошибка при подготовке карты: {e}")
 
-        if img is None:
-            raise Exception(f"Не удалось декодировать карту: {self.map_path}")
-
-        # Инвертируем, чтобы стены были 1, а дороги 0 (для удобства cv2.distanceTransform)
+        # Дальнейшая логика остается прежней (инверсия и раздутие)
         _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
 
         if self.wall_offset > 0:

@@ -164,6 +164,10 @@ class RegionPickerOverlay(QWidget):
             w = abs(self.start_point.x() - self.current_point.x())
             h = abs(self.start_point.y() - self.current_point.y())
             
+            # Скрываем оверлей СРАЗУ, чтобы он не попал на скриншот
+            self.hide()
+            QApplication.processEvents()
+            
             # Отправляем только если область больше 10x10 пикселей
             if w > 10 and h > 10:
                 self.region_picked.emit(x, y, w, h)

@@ -2,6 +2,8 @@ import os
 import cv2
 import numpy as np
 import mss
+import json
+import time
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 from PIL import Image, ImageDraw
@@ -53,14 +55,13 @@ class MapRecorder(QThread):
         self.brush_radius = brush_radius
         self.char_color = char_color
         self.is_reverse = is_reverse
-        self.last_pos = None # Для рисования линий
+        self.last_pos = None 
         
         self.map_dir = os.path.join(ASSETS_DIR, "maps", map_name)
         os.makedirs(self.map_dir, exist_ok=True)
         
         self.walkability_path = os.path.join(self.map_dir, "walkability.png")
         
-        # Читаем регион из настроек
         region_str = self.settings_obj.value("minimap_region", "", type=str)
         if not region_str:
             print("Регион миникарты не задан!")
@@ -72,19 +73,22 @@ class MapRecorder(QThread):
         except Exception:
             return False
             
-        # Подготовка изображения проходимости
+        # ГЛОБАЛЬНЫЙ ХОЛСТ: Определяем физический размер экрана
+        screen = QApplication.primaryScreen()
+        scale = screen.devicePixelRatio() if screen else 1.0
+        geom = screen.geometry()
+        phys_w = int(geom.width() * scale)
+        phys_h = int(geom.height() * scale)
+
         if os.path.exists(self.walkability_path):
             self.walkability_img = Image.open(self.walkability_path).convert("RGB")
-            # Проверяем, соответствует ли размер текущему региону (логическому)
-            if self.walkability_img.size != (self.region["width"], self.region["height"]):
-                # Если регион изменился, создаем новую черную карту
-                self.walkability_img = Image.new("RGB", (self.region["width"], self.region["height"]), "black")
+            if self.walkability_img.size != (phys_w, phys_h):
+                self.walkability_img = Image.new("RGB", (phys_w, phys_h), "black")
         else:
-            self.walkability_img = Image.new("RGB", (self.region["width"], self.region["height"]), "black")
+            self.walkability_img = Image.new("RGB", (phys_w, phys_h), "black")
             
         self.walkability_draw = ImageDraw.Draw(self.walkability_img)
         
-        # Порог уверенности
         try:
             self.threshold = float(self.settings_obj.value("match_threshold", "75", type=str)) / 100.0
         except ValueError:
@@ -99,8 +103,15 @@ class MapRecorder(QThread):
         self.wait()
         
     def run(self):
+        region_info_path = os.path.join(self.map_dir, "region.json")
+        try:
+            with open(region_info_path, "r") as f:
+                reg_data = json.load(f)
+        except:
+            print("ОШИБКА: Файл region.json не найден. Запись невозможна.")
+            return
+
         with mss.mss() as sct:
-            # Учитываем масштаб
             screen = QApplication.primaryScreen()
             scale = screen.devicePixelRatio() if screen else 1.0
             
@@ -111,60 +122,51 @@ class MapRecorder(QThread):
                 "height": int(self.region["height"] * scale)
             }
             
-            # Кисть для рисования
             radius = self.brush_radius
             
             while self.is_running:
                 try:
-                    # 1. Скриншот (физический регион)
                     sct_img = sct.grab(phys_region)
                     img = np.array(sct_img)
-                    
-                    # Убираем альфа-канал
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                     
-                    # 2. Поиск маркера
                     if getattr(self, 'marker_mask', None) is not None:
                         result = cv2.matchTemplate(img_rgb, self.marker_template, cv2.TM_CCORR_NORMED, mask=self.marker_mask)
                     else:
                         result = cv2.matchTemplate(img_rgb, self.marker_template, cv2.TM_CCORR_NORMED)
-                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                    
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
                     
                     if max_val >= self.threshold:
-                        # Маркер найден. max_loc - координаты в ФИЗИЧЕСКИХ пикселях.
-                        # Переводим в ЛОГИЧЕСКИЕ (чтобы совпадало с размером картинки)
-                        found_x_logical = max_loc[0] / scale
-                        found_y_logical = max_loc[1] / scale
+                        phys_region_x = int(self.region["left"] * scale)
+                        phys_region_y = int(self.region["top"] * scale)
+                        marker_h_phys, marker_w_phys = self.marker_template.shape[:2]
                         
                         if self.centering_enabled:
-                            # Добавляем смещение перекрестья (оно уже логическое)
-                            center_x = found_x_logical + self.centering_offset[0]
-                            center_y = found_y_logical + self.centering_offset[1]
+                            found_x_phys = max_loc[0] + (self.centering_offset[0] * scale)
+                            found_y_phys = max_loc[1] + (self.centering_offset[1] * scale)
                         else:
-                            # Если без центрирования - берем центр самого маркера
-                            marker_h, marker_w = self.marker_template.shape[:2]
-                            center_x = found_x_logical + (marker_w / scale) / 2
-                            center_y = found_y_logical + (marker_h / scale) / 2
+                            found_x_phys = max_loc[0] + marker_w_phys / 2
+                            found_y_phys = max_loc[1] + marker_h_phys / 2
                             
-                        # Текущая точка для отрисовки
-                        current_pos = (int(center_x), int(center_y))
+                        global_x_phys = int(phys_region_x + found_x_phys)
+                        global_y_phys = int(phys_region_y + found_y_phys)
                         
-                        # Цвет закраски: белый для дорог, черный для препятствий (реверс)
+                        current_pos = (global_x_phys, global_y_phys)
                         paint_color = "black" if self.is_reverse else "white"
 
-                        # Рисуем строго выбранным цветом на основной карте
-                        if self.last_pos is not None:
-                            # Рисуем толстую линию от прошлой точки к текущей
-                            self.walkability_draw.line([self.last_pos, current_pos], fill=paint_color, width=radius*2)
-                        
-                        self.walkability_draw.ellipse(
-                            (current_pos[0] - radius, current_pos[1] - radius, current_pos[0] + radius, current_pos[1] + radius), 
-                            fill=paint_color
-                        )
+                        try:
+                            if self.last_pos is not None:
+                                self.walkability_draw.line([self.last_pos, current_pos], fill=paint_color, width=int(radius * scale * 2))
+                            
+                            self.walkability_draw.ellipse(
+                                (current_pos[0] - int(radius*scale), current_pos[1] - int(radius*scale), 
+                                 current_pos[0] + int(radius*scale), current_pos[1] + int(radius*scale)), 
+                                fill=paint_color
+                            )
+                        except Exception: pass
                         
                         self.last_pos = current_pos
-                        
-                        # Сохраняем промежуточный результат и обновляем UI
                         self.walkability_img.save(self.walkability_path)
                         self.preview_updated.emit(os.path.abspath(self.walkability_path))
                         
