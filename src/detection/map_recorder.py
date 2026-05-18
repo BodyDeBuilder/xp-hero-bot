@@ -32,16 +32,13 @@ class MapRecorder(QThread):
     def load_marker(self):
         marker_template_full = cv2.imread(self.marker_path, cv2.IMREAD_UNCHANGED)
         if marker_template_full is not None:
-            if len(marker_template_full.shape) == 4:
+            if len(marker_template_full.shape) == 3 and marker_template_full.shape[2] == 4:
                 self.marker_template = cv2.cvtColor(marker_template_full, cv2.COLOR_BGRA2BGR)
-                alpha_channel = marker_template_full[:, :, 3]
-                _, self.marker_mask = cv2.threshold(alpha_channel, 127, 255, cv2.THRESH_BINARY)
             else:
                 self.marker_template = cv2.imread(self.marker_path, cv2.IMREAD_COLOR)
-                self.marker_mask = None
         else:
             self.marker_template = None
-            self.marker_mask = None
+        self.marker_mask = None
             
     def start_recording(self, map_name, interval_ms=500, centering_enabled=False, centering_offset=(0, 0), brush_radius=4, char_color=(0, 255, 0), is_reverse=False):
         if self.marker_template is None:

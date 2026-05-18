@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QMessageBox, QSlider, QComboBox, QColorDialog, QDialog,
     QApplication, QButtonGroup, QMenu, QGridLayout
 )
-from PyQt6.QtCore import Qt, QSettings, pyqtSignal, QTimer, QPoint, QRect
+from PyQt6.QtCore import Qt, QSettings, pyqtSignal, QTimer, QPoint, QRect, QThread
 from PyQt6.QtGui import QPainter, QPen, QPixmap, QColor, QBrush, QImage, QAction, QKeySequence
 import os
 import json
@@ -16,7 +16,47 @@ import numpy as np
 import pyautogui
 import re
 import math
-import shutil
+import ctypes
+
+class GlobalHotkeyThread(QThread):
+    hotkey_triggered = pyqtSignal()
+    
+    def run(self):
+        VK_CONTROL = 0x11
+        ctrl_presses = 0
+        last_press_time = 0
+        
+        try:
+            user32 = ctypes.windll.user32
+        except Exception:
+            return # На случай запуска не на Windows
+            
+        while True:
+            try:
+                state = user32.GetAsyncKeyState(VK_CONTROL)
+                is_down = bool(state & 0x8000)
+                
+                if is_down:
+                    current_time = time.time()
+                    if current_time - last_press_time > 0.15: # Защита от дребезга контактов
+                        if current_time - last_press_time < 1.2:
+                            ctrl_presses += 1
+                        else:
+                            ctrl_presses = 1
+                        last_press_time = current_time
+                        print(f"DEBUG HOTKEY: Ctrl pressed {ctrl_presses}/5")
+                        
+                        if ctrl_presses >= 5:
+                            print("DEBUG HOTKEY: EMERGENCY STOP TRIGGERED!")
+                            self.hotkey_triggered.emit()
+                            ctrl_presses = 0
+                    
+                    # Ожидаем отпускания клавиши
+                    while bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000):
+                        time.sleep(0.05)
+            except Exception:
+                pass
+            time.sleep(0.05)
 
 from src.detection.map_recorder import MapRecorder
 from src.tools.navigation import PathFinder
@@ -194,12 +234,14 @@ class TestMoveThread(QThread):
             time.sleep(1.5)
             
             # 2. Активация окна (клик в центр джойстика)
-            # ВАЖНО: pyautogui работает в ЛОГИЧЕСКИХ координатах
+            # ВАЖНО: Поскольку процесс DPI-aware, pyautogui (низкоуровневый API) требует физических координат.
             log_joy_x = int(self.joy_settings['x'])
             log_joy_y = int(self.joy_settings['y'])
+            phys_joy_x = int(log_joy_x * self.scale)
+            phys_joy_y = int(log_joy_y * self.scale)
 
-            print(f"DEBUG NAV: Clicking joystick at logical ({log_joy_x}, {log_joy_y})")
-            pyautogui.click(log_joy_x, log_joy_y)
+            print(f"DEBUG NAV: Clicking joystick at physical ({phys_joy_x}, {phys_joy_y}) (logical: {log_joy_x}, {log_joy_y})")
+            pyautogui.click(phys_joy_x, phys_joy_y)
             time.sleep(0.8)
 
             # Загружаем маркер
@@ -208,14 +250,12 @@ class TestMoveThread(QThread):
                 self.error_occurred.emit("Не удалось загрузить маркер (mark.png)")
                 return
 
-            if len(mark_img_full.shape) == 4:
+            # Проверяем наличие альфа-канала (3 измерения в shape, 4-й канал в 3-м измерении)
+            if len(mark_img_full.shape) == 3 and mark_img_full.shape[2] == 4:
                 template = cv2.cvtColor(mark_img_full, cv2.COLOR_BGRA2BGR).astype(np.uint8)
-                alpha = mark_img_full[:, :, 3]
-                _, mask = cv2.threshold(alpha, 127, 255, cv2.THRESH_BINARY)
-                mask = mask.astype(np.uint8)
             else:
-                template = mark_img_full.astype(np.uint8)
-                mask = None
+                template = cv2.imread(self.marker_path, cv2.IMREAD_COLOR)
+            mask = None
 
             marker_h, marker_w = template.shape[:2]
             
@@ -224,7 +264,7 @@ class TestMoveThread(QThread):
             max_duration = 30.0
 
             print("DEBUG NAV: Starting movement loop...")
-            pyautogui.mouseDown(log_joy_x, log_joy_y)
+            pyautogui.mouseDown(phys_joy_x, phys_joy_y)
 
             path = []
             path_index = 0
@@ -274,36 +314,49 @@ class TestMoveThread(QThread):
                             target_rel_x = self.target_pos[0]
                             target_rel_y = self.target_pos[1]
 
+                        print(f"DEBUG NAV: Target logical relative: ({int(target_rel_x)}, {int(target_rel_y)})")
+
                         if not path:
                             print(f"DEBUG NAV: Planning path from ({int(rel_x)}, {int(rel_y)}) to ({int(target_rel_x)}, {int(target_rel_y)})")
                             path = finder.get_path((rel_x, rel_y), (target_rel_x, target_rel_y))
                             if not path:
+                                print(f"DEBUG NAV: Path planning returned None or Empty! Stopping thread with navigation error.")
                                 self.error_occurred.emit("Путь не найден! Убедитесь, что вы и цель стоите на белых маршрутах.")
                                 break
+                            print(f"DEBUG NAV: Path planned successfully. Waypoints: {path}")
                             path_index = 0
 
-                        # Проверяем расстояние до финальной цели
+                        # Проверяем расстояние до финальной цели с учетом эффективной минимальной погрешности
+                        effective_tolerance = max(2.5, self.target_tolerance)
                         final_dist = math.sqrt((target_rel_x - rel_x)**2 + (target_rel_y - rel_y)**2)
-                        if final_dist < self.target_tolerance:
+                        print(f"DEBUG NAV: Distance to final target: {final_dist:.2f} logical pixels (tolerance: {self.target_tolerance} px, effective: {effective_tolerance} px)")
+                        if final_dist < effective_tolerance:
+                            print(f"DEBUG NAV: Distance {final_dist:.2f} < effective tolerance {effective_tolerance}. Arrived! Breaking movement loop.")
                             break
 
                         if path_index < len(path):
                             waypoint = path[path_index]
                             wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
+                            print(f"DEBUG NAV: Heading to waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px)")
 
-                            if wp_dist < 5 and path_index < len(path) - 1:
+                            # Уменьшаем порог переключения до 3.5 логических пикселей для точного прохождения крутых поворотов
+                            if wp_dist < 3.5 and path_index < len(path) - 1:
                                 path_index += 1
                                 waypoint = path[path_index]
+                                wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
+                                print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px)")
 
                             dx = waypoint[0] - rel_x
                             dy = waypoint[1] - rel_y
                             angle = math.atan2(dy, dx)
 
-                            # Тянем джойстик (в логических координатах)
-                            drag_x = log_joy_x + math.cos(angle) * self.joy_settings['radius']
-                            drag_y = log_joy_y + math.sin(angle) * self.joy_settings['radius']
+                            # Тянем джойстик на полную мощность без замедления, как запросил пользователь
+                            phys_radius = self.joy_settings['radius'] * self.scale
+                            drag_x_phys = phys_joy_x + math.cos(angle) * phys_radius
+                            drag_y_phys = phys_joy_y + math.sin(angle) * phys_radius
 
-                            pyautogui.moveTo(int(drag_x), int(drag_y), duration=0.05)
+                            print(f"DEBUG NAV: Dragging joystick to physical: ({int(drag_x_phys)}, {int(drag_y_phys)}) [angle: {math.degrees(angle):.1f}°]")
+                            pyautogui.moveTo(int(drag_x_phys), int(drag_y_phys), duration=0.05)
                     time.sleep(self.scan_interval)
 
             pyautogui.mouseUp()
@@ -345,13 +398,11 @@ class AutoDetector(QThread):
                 self.finished.emit(None)
                 return
 
-            if len(mark_img_full.shape) == 4:
+            if len(mark_img_full.shape) == 3 and mark_img_full.shape[2] == 4:
                 template = cv2.cvtColor(mark_img_full, cv2.COLOR_BGRA2BGR)
-                alpha_channel = mark_img_full[:, :, 3]
-                _, mask = cv2.threshold(alpha_channel, 127, 255, cv2.THRESH_BINARY)
             else:
                 template = cv2.imread(self.mark_path, cv2.IMREAD_COLOR)
-                mask = None
+            mask = None
 
             try:
                 x_reg, y_reg, w_reg, h_reg = map(int, self.region_str.split(","))
@@ -396,9 +447,9 @@ class AutoDetector(QThread):
                             found_y = y_reg + max_loc[1] / scale
                             
                             if self.centering_enabled:
-                                # Добавляем смещение центра относительно левого верхнего угла
-                                final_x = int(found_x + self.centering_offset[0])
-                                final_y = int(found_y + self.centering_offset[1])
+                                # Добавляем смещение центра относительно левого верхнего угла (переводя в логические пиксели)
+                                final_x = int(found_x + self.centering_offset[0] / scale)
+                                final_y = int(found_y + self.centering_offset[1] / scale)
                             else:
                                 # Если центрирование выключено, используем центр самого маркера
                                 marker_h, marker_w = template.shape[:2]
@@ -435,10 +486,12 @@ class InteractiveMapWidget(QWidget):
         # Загружаем через OpenCV чтобы гарантированно получить альфа-канал
         img = cv2.imread(self.image_path, cv2.IMREAD_UNCHANGED)
         if img is not None:
-            if len(img.shape) == 3: # Если нет альфа-канала, добавляем его
-                self.img_data = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA)
-            elif len(img.shape) == 4:
+            if len(img.shape) == 3 and img.shape[2] == 4:
                 self.img_data = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+            elif len(img.shape) == 3 and img.shape[2] == 3:
+                self.img_data = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA)
+            elif len(img.shape) == 2:
+                self.img_data = cv2.cvtColor(img, cv2.COLOR_GRAY2RGBA)
         else:
             self.img_data = np.zeros((20, 20, 4), dtype=np.uint8)
             self.img_data[:,:,3] = 255 # Непрозрачный фон
@@ -607,6 +660,11 @@ class SettingsPage(QWidget):
         self.current_coords_tab = "buttons" # По умолчанию
         self.map_recorder = MapRecorder(self.settings_obj)
         self.map_recorder.preview_updated.connect(self.on_map_preview_updated)
+        
+        # Инициализируем глобальный поток отслеживания хоткея экстренной остановки
+        self.hotkey_thread = GlobalHotkeyThread(self)
+        self.hotkey_thread.hotkey_triggered.connect(self.emergency_stop)
+        self.hotkey_thread.start()
         
         # Миграция из Сундуков в Подарки (один раз)
         if not self.settings_obj.value("migrated_chests_to_gifts_v1", False, type=bool):
@@ -1961,12 +2019,10 @@ class SettingsPage(QWidget):
             QMessageBox.warning(self, "Ошибка", "Не удалось загрузить маркер.")
             return
             
-        # Подготовка маски, если есть альфа-канал
+        # Подготовка маркера без маски (маска делает поиск нестабильным на темном фоне)
         mask = None
-        if len(marker_template_full.shape) == 4:
+        if len(marker_template_full.shape) == 3 and marker_template_full.shape[2] == 4:
             marker_template = cv2.cvtColor(marker_template_full, cv2.COLOR_BGRA2BGR)
-            alpha_channel = marker_template_full[:, :, 3]
-            _, mask = cv2.threshold(alpha_channel, 127, 255, cv2.THRESH_BINARY)
         else:
             marker_template = cv2.imread(marker_path, cv2.IMREAD_COLOR)
             
@@ -2044,10 +2100,10 @@ class SettingsPage(QWidget):
                     
                     # Добавляем смещение (если включено центрирование)
                     if self.cb_enable_centering.isChecked():
-                        # self.interactive_map.original_x - это логические координаты
-                        # нужно перевести их в физические для отрисовки на snapshot
-                        target_cx = marker_box_left + int(self.interactive_map.original_x * scale)
-                        target_cy = marker_box_top + int(self.interactive_map.original_y * scale)
+                        # self.interactive_map.original_x уже находится в физических пикселях маркера,
+                        # поэтому переводить умножением на scale не требуется.
+                        target_cx = marker_box_left + int(self.interactive_map.original_x)
+                        target_cy = marker_box_top + int(self.interactive_map.original_y)
                         cv2.circle(snapshot, (target_cx, target_cy), 3, (255, 0, 0), -1)
                     
                     self.show_marker_snapshot(snapshot, max_val)
@@ -2595,3 +2651,35 @@ class SettingsPage(QWidget):
             self.rec_stop_btn.setEnabled(False)
             self.rec_map_combo.setEnabled(True)
             self.on_map_selected()
+
+    def emergency_stop(self):
+        print("DEBUG: Emergency stop triggered!")
+        import pyautogui
+        pyautogui.mouseUp()
+        
+        # 1. Останавливаем поток движения
+        if hasattr(self, 'move_thread') and self.move_thread and self.move_thread.isRunning():
+            print("DEBUG: Terminating move_thread...")
+            self.move_thread.terminate()
+            self.move_thread.wait()
+            self.move_thread = None
+            
+        # 2. Останавливаем поток автодетектора
+        if hasattr(self, 'detector_thread') and self.detector_thread and self.detector_thread.isRunning():
+            print("DEBUG: Terminating detector_thread...")
+            self.detector_thread.terminate()
+            self.detector_thread.wait()
+            self.detector_thread = None
+            
+        # 3. Останавливаем запись карты
+        if hasattr(self, 'map_recorder') and self.map_recorder and self.map_recorder.is_running:
+            print("DEBUG: Stopping map recording...")
+            self.stop_map_recording()
+            
+        # 4. Восстанавливаем окно бота
+        self.main_window.showNormal()
+        self.main_window.raise_()
+        self.main_window.activateWindow()
+        
+        # 5. Показываем стилизованное уведомление
+        QMessageBox.information(self, "Экстренная остановка", "Все фоновые процессы бота (тестовый бег, автодетект, запись карты) принудительно остановлены по нажатию Ctrl 5 раз!")
