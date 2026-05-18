@@ -203,7 +203,7 @@ class TestMoveThread(QThread):
     finished = Signal()
     error_occurred = Signal(str)
 
-    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8):
+    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8, save_debug_map=False):
         super().__init__()
         self.target_pos = target_pos # (x, y)
         self.joy_settings = joy_settings # {x, y, radius}
@@ -219,6 +219,9 @@ class TestMoveThread(QThread):
         self.wall_offset = wall_offset
         self.wp_straight = wp_straight
         self.wp_turn = wp_turn
+        self.save_debug_map = save_debug_map
+        self.visited_path = []
+        self.planned_path = []
 
     def run(self):
         try:
@@ -307,6 +310,7 @@ class TestMoveThread(QThread):
                             rel_y = found_y_rel_log + (marker_h / self.scale) / 2
 
                         print(f"DEBUG NAV: Character at RegionLog({int(rel_x)}, {int(rel_y)})")
+                        self.visited_path.append((rel_x, rel_y))
 
                         # Определяем цель
                         if self.target_pos[0] > self.region["width"]:
@@ -321,6 +325,7 @@ class TestMoveThread(QThread):
                         if not path:
                             print(f"DEBUG NAV: Planning path from ({int(rel_x)}, {int(rel_y)}) to ({int(target_rel_x)}, {int(target_rel_y)})")
                             path = finder.get_path((rel_x, rel_y), (target_rel_x, target_rel_y))
+                            self.planned_path = path
                             if not path:
                                 print(f"DEBUG NAV: Path planning returned None or Empty! Stopping thread with navigation error.")
                                 self.error_occurred.emit("Путь не найден! Убедитесь, что вы и цель стоите на белых маршрутах.")
@@ -344,8 +349,13 @@ class TestMoveThread(QThread):
                             # Определяем, является ли поворот крутым (угол > ~45 градусов)
                             is_sharp_turn = False
                             if path_index < len(path) - 1:
-                                curr_dx = waypoint[0] - rel_x
-                                curr_dy = waypoint[1] - rel_y
+                                if path_index > 0:
+                                    prev_wp = path[path_index-1]
+                                    curr_dx = waypoint[0] - prev_wp[0]
+                                    curr_dy = waypoint[1] - prev_wp[1]
+                                else:
+                                    curr_dx = waypoint[0] - rel_x
+                                    curr_dy = waypoint[1] - rel_y
                                 next_dx = path[path_index+1][0] - waypoint[0]
                                 next_dy = path[path_index+1][1] - waypoint[1]
                                 curr_len = math.hypot(curr_dx, curr_dy)
@@ -386,7 +396,66 @@ class TestMoveThread(QThread):
             import traceback
             traceback.print_exc()
         finally:
+            self.save_debug_image()
             self.finished.emit()
+
+    def save_debug_image(self):
+        if not self.save_debug_map or len(self.visited_path) == 0:
+            return
+        try:
+            # Загружаем и вырезаем регион
+            with open(self.map_path, "rb") as f:
+                chunk = np.frombuffer(f.read(), dtype=np.uint8)
+                full_img = cv2.imdecode(chunk, cv2.IMREAD_GRAYSCALE)
+            
+            if full_img is not None:
+                # Конвертируем ч/б карту в BGR, чтобы рисовать цветом
+                img_bgr = cv2.cvtColor(full_img, cv2.COLOR_GRAY2BGR)
+                
+                # Вычисляем регион выреза так же, как в PathFinder
+                region_info = None
+                map_dir = os.path.dirname(self.map_path)
+                region_info_path = os.path.join(map_dir, "region.json")
+                if os.path.exists(region_info_path):
+                    with open(region_info_path, "r") as f:
+                        region_info = json.load(f)
+                
+                if region_info:
+                    scale = region_info.get("scale", self.scale)
+                    px = int(region_info["x"] * scale)
+                    py = int(region_info["y"] * scale)
+                    pw = int(region_info["w"] * scale)
+                    ph = int(region_info["h"] * scale)
+                    y2, x2 = min(img_bgr.shape[0], py+ph), min(img_bgr.shape[1], px+pw)
+                    cropped_bgr = img_bgr[py:y2, px:x2].copy()
+                else:
+                    cropped_bgr = img_bgr.copy()
+                    scale = self.scale
+                
+                # Рисуем запланированный путь (синим цветом: (255, 0, 0))
+                if hasattr(self, 'planned_path') and self.planned_path:
+                    for idx in range(len(self.planned_path) - 1):
+                        pt1 = (int(self.planned_path[idx][0] * scale), int(self.planned_path[idx][1] * scale))
+                        pt2 = (int(self.planned_path[idx+1][0] * scale), int(self.planned_path[idx+1][1] * scale))
+                        cv2.line(cropped_bgr, pt1, pt2, (255, 0, 0), 1)
+                
+                # Рисуем фактический маршрут героя (красным цветом: (0, 0, 255))
+                for idx in range(len(self.visited_path) - 1):
+                    pt1 = (int(self.visited_path[idx][0] * scale), int(self.visited_path[idx][1] * scale))
+                    pt2 = (int(self.visited_path[idx+1][0] * scale), int(self.visited_path[idx+1][1] * scale))
+                    cv2.line(cropped_bgr, pt1, pt2, (0, 0, 255), 1)
+                    
+                # Рисуем точки вейпоинтов (зеленым: (0, 255, 0))
+                if hasattr(self, 'planned_path') and self.planned_path:
+                    for pt in self.planned_path:
+                        cv2.circle(cropped_bgr, (int(pt[0] * scale), int(pt[1] * scale)), 1, (0, 255, 0), -1)
+
+                # Сохраняем в ассеты
+                debug_img_path = os.path.join(os.path.dirname(self.marker_path), "debug_test_run.png")
+                cv2.imwrite(debug_img_path, cropped_bgr)
+                print(f"DEBUG NAV: Saved debug map to {debug_img_path}")
+        except Exception as ex:
+            print(f"DEBUG: Не удалось сохранить отладочную карту: {ex}")
 
 class AutoDetector(QThread):
     finished = Signal(object) # Передает (x, y) или None
@@ -1379,8 +1448,19 @@ class SettingsPage(QWidget):
         
         # Тестовый бег (справа от превью)
         test_move_layout = QVBoxLayout()
+        
+        test_header_layout = QHBoxLayout()
         test_move_label = QLabel("Тестовый бег")
         test_move_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-top: 10px;")
+        
+        self.cb_save_debug_map = QCheckBox()
+        self.cb_save_debug_map.setChecked(self.settings_obj.value("save_debug_map", False, type=bool))
+        self.cb_save_debug_map.setStyleSheet("margin-top: 10px;")
+        self.cb_save_debug_map.stateChanged.connect(lambda state: self.settings_obj.setValue("save_debug_map", state == 2))
+        
+        test_header_layout.addWidget(test_move_label)
+        test_header_layout.addWidget(self.cb_save_debug_map)
+        test_header_layout.addStretch()
         
         self.test_coords_input = QLineEdit()
         self.test_coords_input.setPlaceholderText("Вставьте X, Y (напр. 100, 200)")
@@ -1391,7 +1471,7 @@ class SettingsPage(QWidget):
         test_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         test_run_btn.clicked.connect(self.run_test_move)
         
-        test_move_layout.addWidget(test_move_label)
+        test_move_layout.addLayout(test_header_layout)
         test_move_layout.addWidget(self.test_coords_input)
         test_move_layout.addWidget(test_run_btn)
 
@@ -2510,7 +2590,8 @@ class SettingsPage(QWidget):
             target_pos, joy_settings, region, scale, marker_path, threshold,
             self.cb_enable_centering.isChecked(),
             (self.interactive_map.original_x, self.interactive_map.original_y),
-            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn
+            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn,
+            self.cb_save_debug_map.isChecked()
         )
         
         def on_move_finished():
@@ -2706,6 +2787,8 @@ class SettingsPage(QWidget):
         
         # 1. Останавливаем поток движения
         if hasattr(self, 'move_thread') and self.move_thread and self.move_thread.isRunning():
+            print("DEBUG: Saving debug image before terminating move_thread...")
+            self.move_thread.save_debug_image()
             print("DEBUG: Terminating move_thread...")
             self.move_thread.terminate()
             self.move_thread.wait()
