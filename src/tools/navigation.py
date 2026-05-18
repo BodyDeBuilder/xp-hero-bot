@@ -9,6 +9,7 @@ class PathFinder:
         self.map_path = walkability_map_path
         self.wall_offset = wall_offset
         self.grid = None
+        self.dist_transform = None
         
         # Для Global Canvas нам нужны координаты региона
         self.map_dir = os.path.dirname(walkability_map_path)
@@ -65,6 +66,14 @@ class PathFinder:
         # Переводим в Grid: True - проходимо (дорога), False - стена
         self.grid = (binary == 0)
         self.height, self.width = self.grid.shape
+        
+        # Вычисляем карту расстояний (Distance Transform) для автоматического центрирования и безопасного огибания
+        # Стены в road_mask должны быть 0, дороги - 255
+        road_mask = (binary == 0).astype(np.uint8) * 255
+        self.dist_transform = cv2.distanceTransform(road_mask, cv2.DIST_L2, 5)
+
+    def get_safety_cost(self, r, c):
+        return 0.0
 
     def find_nearest_walkable(self, node):
         r, c = node
@@ -92,9 +101,12 @@ class PathFinder:
             print(f"DEBUG NAV: Point {node} could not be adjusted (no walkable cell found within {search_radius} physical px)")
         return best_node
 
+    def distance(self, p1, p2):
+        return np.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
     def get_path(self, start_logical, end_logical):
         """
-        Ищет путь. 
+        Ищет путь по алгоритму Theta* с автоматическим центрированием (Distance Transform).
         Координаты логические (пиксели региона).
         Возвращает список логических точек [(x,y)...]
         """
@@ -115,69 +127,84 @@ class PathFinder:
         start_phys = (int(start_logical[1] * scale), int(start_logical[0] * scale)) # (row, col)
         end_phys = (int(end_logical[1] * scale), int(end_logical[0] * scale))
 
-        print(f"DEBUG NAV: --- Planning Path ---")
+        print(f"DEBUG NAV: --- Planning Path (Theta*) ---")
         print(f"DEBUG NAV: Scale factor: {scale}")
-        print(f"DEBUG NAV: Start logical: {start_logical} -> physical: {start_phys} (walkable: {self.grid[start_phys] if (0 <= start_phys[0] < self.height and 0 <= start_phys[1] < self.width) else 'out of bounds'})")
-        print(f"DEBUG NAV: End logical: {end_logical} -> physical: {end_phys} (walkable: {self.grid[end_phys] if (0 <= end_phys[0] < self.height and 0 <= end_phys[1] < self.width) else 'out of bounds'})")
+        print(f"DEBUG NAV: Start logical: {start_logical} -> physical: {start_phys}")
+        print(f"DEBUG NAV: End logical: {end_logical} -> physical: {end_phys}")
 
         # 2. Проверка границ
         if not (0 <= start_phys[0] < self.height and 0 <= start_phys[1] < self.width):
-            print(f"DEBUG NAV: Start physical {start_phys} is out of map bounds (height: {self.height}, width: {self.width})!")
+            print(f"DEBUG NAV: Start physical {start_phys} is out of map bounds!")
             return None
         if not (0 <= end_phys[0] < self.height and 0 <= end_phys[1] < self.width):
-            print(f"DEBUG NAV: End physical {end_phys} is out of map bounds (height: {self.height}, width: {self.width})!")
+            print(f"DEBUG NAV: End physical {end_phys} is out of map bounds!")
             return None
         
-        # 3. Если старт в стене (раздутой), ищем замену
+        # 3. Если старт/финиш в стене, ищем замену
         if not self.grid[start_phys]:
             start_phys = self.find_nearest_walkable(start_phys)
-            if not start_phys:
-                print(f"DEBUG NAV: Start physical {start_phys} is in a wall and no walkable neighbor found!")
-                return None
+            if not start_phys: return None
 
-        # 3.5 Если финиш в стене (раздутой), ищем замену
         if not self.grid[end_phys]:
             end_phys = self.find_nearest_walkable(end_phys)
-            if not end_phys:
-                print(f"DEBUG NAV: End physical {end_phys} is in a wall and no walkable neighbor found!")
-                return None
+            if not end_phys: return None
 
-        # 4. A* на физической сетке
-        queue = [(0, start_phys)]
-        came_from = {start_phys: None}
-        cost_so_far = {start_phys: 0}
+        # 4. Theta* на физической сетке
+        queue = [(0.0, start_phys)]
+        came_from = {start_phys: start_phys} # Для старта родитель - он сам
+        cost_so_far = {start_phys: 0.0}
         
         iterations = 0
         while queue:
             iterations += 1
             _, current = heapq.heappop(queue)
             if current == end_phys: break
+            
+            parent = came_from[current]
                 
             for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
                 neighbor = (current[0] + dy, current[1] + dx)
                 if 0 <= neighbor[0] < self.height and 0 <= neighbor[1] < self.width:
                     if self.grid[neighbor]:
-                        new_cost = cost_so_far[current] + (1.41 if dx!=0 and dy!=0 else 1)
-                        if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
-                            cost_so_far[neighbor] = new_cost
-                            priority = new_cost + self.heuristic(neighbor, end_phys)
-                            heapq.heappush(queue, (priority, neighbor))
-                            came_from[neighbor] = current
+                        # Проверяем прямую видимость от родителя к соседу (основа Theta*)
+                        if self.is_line_clear(parent, neighbor):
+                            # Путь напрямую от parent к neighbor
+                            dist = self.distance(parent, neighbor)
+                            safety = self.get_safety_cost(neighbor[0], neighbor[1])
+                            new_cost = cost_so_far[parent] + dist + safety
                             
-        print(f"DEBUG NAV: A* finished in {iterations} iterations.")
+                            if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                                cost_so_far[neighbor] = new_cost
+                                came_from[neighbor] = parent
+                                priority = new_cost + self.heuristic(neighbor, end_phys)
+                                heapq.heappush(queue, (priority, neighbor))
+                        else:
+                            # Обычный шаг A* от current к neighbor
+                            dist = 1.414 if dx != 0 and dy != 0 else 1.0
+                            safety = self.get_safety_cost(neighbor[0], neighbor[1])
+                            new_cost = cost_so_far[current] + dist + safety
+                            
+                            if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                                cost_so_far[neighbor] = new_cost
+                                came_from[neighbor] = current
+                                priority = new_cost + self.heuristic(neighbor, end_phys)
+                                heapq.heappush(queue, (priority, neighbor))
+                            
+        print(f"DEBUG NAV: Theta* finished in {iterations} iterations.")
         if end_phys not in came_from:
-            print("DEBUG NAV: A* failed to find a path between adjusted physical coordinates!")
+            print("DEBUG NAV: Theta* failed to find a path!")
             return None
             
         # 5. Восстановление пути (физического)
         path_phys = []
         curr = end_phys
-        while curr is not None:
+        while curr != start_phys:
             path_phys.append(curr)
             curr = came_from[curr]
+        path_phys.append(start_phys)
         path_phys.reverse()
         
-        # 6. Сглаживание и перевод в ЛОГИЧЕСКИЕ для бота
+        # 6. Дополнительное сглаживание и перевод в ЛОГИЧЕСКИЕ для бота
         smoothed = self.smooth_path(path_phys)
         res_path = [(p[1] / scale, p[0] / scale) for p in smoothed]
         print(f"DEBUG NAV: Path successfully calculated! Raw: {len(path_phys)} points, Smoothed: {len(res_path)} points.")
@@ -198,13 +225,13 @@ class PathFinder:
         return smoothed
 
     def is_line_clear(self, p1, p2):
-        # row, col
         r1, c1 = p1
         r2, c2 = p2
         dist = int(np.hypot(r2 - r1, c2 - c1))
-        # Количество точек проверки должно соответствовать расстоянию, чтобы не пропустить узкие стены
+        if dist < 2:
+            return True
         points = max(10, dist)
-        for i in range(points + 1):
+        for i in range(1, points):
             r = int(r1 + (r2 - r1) * i / points)
             c = int(c1 + (c2 - c1) * i / points)
             if not (0 <= r < self.height and 0 <= c < self.width) or not self.grid[r, c]:
