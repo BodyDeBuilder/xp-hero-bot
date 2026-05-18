@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QListWidget, 
     QListWidgetItem, QPushButton, QStackedWidget, QLabel, QCheckBox,
-    QLineEdit, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QLineEdit, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QInputDialog, QMessageBox, QSlider, QComboBox, QColorDialog, QDialog,
     QApplication, QButtonGroup, QMenu, QGridLayout
 )
@@ -203,7 +203,7 @@ class TestMoveThread(QThread):
     finished = Signal()
     error_occurred = Signal(str)
 
-    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset):
+    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8):
         super().__init__()
         self.target_pos = target_pos # (x, y)
         self.joy_settings = joy_settings # {x, y, radius}
@@ -217,6 +217,8 @@ class TestMoveThread(QThread):
         self.target_tolerance = target_tolerance
         self.map_path = map_path
         self.wall_offset = wall_offset
+        self.wp_straight = wp_straight
+        self.wp_turn = wp_turn
 
     def run(self):
         try:
@@ -327,7 +329,7 @@ class TestMoveThread(QThread):
                             path_index = 0
 
                         # Проверяем расстояние до финальной цели с учетом эффективной минимальной погрешности
-                        effective_tolerance = max(2.5, self.target_tolerance)
+                        effective_tolerance = max(0.0, self.target_tolerance)
                         final_dist = math.sqrt((target_rel_x - rel_x)**2 + (target_rel_y - rel_y)**2)
                         print(f"DEBUG NAV: Distance to final target: {final_dist:.2f} logical pixels (tolerance: {self.target_tolerance} px, effective: {effective_tolerance} px)")
                         if final_dist < effective_tolerance:
@@ -339,12 +341,29 @@ class TestMoveThread(QThread):
                             wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
                             print(f"DEBUG NAV: Heading to waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px)")
 
-                            # Уменьшаем порог переключения до 3.5 логических пикселей для точного прохождения крутых поворотов
-                            if wp_dist < 3.5 and path_index < len(path) - 1:
+                            # Определяем, является ли поворот крутым (угол > ~45 градусов)
+                            is_sharp_turn = False
+                            if path_index < len(path) - 1:
+                                curr_dx = waypoint[0] - rel_x
+                                curr_dy = waypoint[1] - rel_y
+                                next_dx = path[path_index+1][0] - waypoint[0]
+                                next_dy = path[path_index+1][1] - waypoint[1]
+                                curr_len = math.hypot(curr_dx, curr_dy)
+                                next_len = math.hypot(next_dx, next_dy)
+                                if curr_len > 0.1 and next_len > 0.1:
+                                    dot_product = (curr_dx * next_dx + curr_dy * next_dy) / (curr_len * next_len)
+                                    if dot_product < 0.7:  # cos(45°) ≈ 0.707
+                                        is_sharp_turn = True
+                            
+                            # Для крутых поворотов требуем подойти вплотную, чтобы не срезать угол по диагонали прямо в стену.
+                            # Для прямых участков допускаем больший срез для плавности хода.
+                            current_wp_tolerance = self.wp_turn if is_sharp_turn else self.wp_straight
+
+                            if wp_dist < current_wp_tolerance and path_index < len(path) - 1:
                                 path_index += 1
                                 waypoint = path[path_index]
                                 wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
-                                print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px)")
+                                print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px, sharp_turn: {is_sharp_turn})")
 
                             dx = waypoint[0] - rel_x
                             dy = waypoint[1] - rel_y
@@ -1452,15 +1471,41 @@ class SettingsPage(QWidget):
         target_tol_label = QLabel("Погрешность прибытия в точку (px):")
         target_tol_label.setStyleSheet("font-size: 14px;")
         self.target_tolerance_spin = QSpinBox()
-        self.target_tolerance_spin.setRange(1, 100)
+        self.target_tolerance_spin.setRange(0, 100)
         self.target_tolerance_spin.setValue(self.settings_obj.value("nav_target_tolerance", 10, type=int))
-        self.target_tolerance_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244;")
+        self.target_tolerance_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.target_tolerance_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_target_tolerance", v))
+        
+        # Порог переключения по прямой
+        wp_straight_label = QLabel("Порог переключения по прямой (px):")
+        wp_straight_label.setStyleSheet("font-size: 14px;")
+        self.wp_straight_spin = QDoubleSpinBox()
+        self.wp_straight_spin.setRange(0.0, 20.0)
+        self.wp_straight_spin.setSingleStep(0.5)
+        self.wp_straight_spin.setDecimals(1)
+        self.wp_straight_spin.setValue(float(self.settings_obj.value("nav_wp_straight", 4.0)))
+        self.wp_straight_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.wp_straight_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_wp_straight", v))
+        
+        # Порог переключения на поворотах
+        wp_turn_label = QLabel("Порог переключения на поворотах (px):")
+        wp_turn_label.setStyleSheet("font-size: 14px;")
+        self.wp_turn_spin = QDoubleSpinBox()
+        self.wp_turn_spin.setRange(0.0, 20.0)
+        self.wp_turn_spin.setSingleStep(0.5)
+        self.wp_turn_spin.setDecimals(1)
+        self.wp_turn_spin.setValue(float(self.settings_obj.value("nav_wp_turn", 1.8)))
+        self.wp_turn_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.wp_turn_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_wp_turn", v))
         
         move_grid.addWidget(scan_label, 0, 0)
         move_grid.addWidget(self.scan_interval_spin, 0, 1)
         move_grid.addWidget(target_tol_label, 1, 0)
         move_grid.addWidget(self.target_tolerance_spin, 1, 1)
+        move_grid.addWidget(wp_straight_label, 2, 0)
+        move_grid.addWidget(self.wp_straight_spin, 2, 1)
+        move_grid.addWidget(wp_turn_label, 3, 0)
+        move_grid.addWidget(self.wp_turn_spin, 3, 1)
         
         move_layout.addLayout(move_grid)
         move_layout.addStretch()
@@ -2458,12 +2503,14 @@ class SettingsPage(QWidget):
         scan_interval = self.scan_interval_spin.value()
         target_tolerance = self.target_tolerance_spin.value()
         wall_offset = self.nav_offset_spin.value()
+        wp_straight = self.wp_straight_spin.value()
+        wp_turn = self.wp_turn_spin.value()
         
         self.move_thread = TestMoveThread(
             target_pos, joy_settings, region, scale, marker_path, threshold,
             self.cb_enable_centering.isChecked(),
             (self.interactive_map.original_x, self.interactive_map.original_y),
-            scan_interval, target_tolerance, map_path, wall_offset
+            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn
         )
         
         def on_move_finished():
