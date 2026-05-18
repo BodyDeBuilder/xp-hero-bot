@@ -203,7 +203,7 @@ class TestMoveThread(QThread):
     finished = Signal()
     error_occurred = Signal(str)
 
-    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8, save_debug_map=False):
+    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8, save_debug_map=False, passive_mode=False):
         super().__init__()
         self.target_pos = target_pos # (x, y)
         self.joy_settings = joy_settings # {x, y, radius}
@@ -219,7 +219,8 @@ class TestMoveThread(QThread):
         self.wall_offset = wall_offset
         self.wp_straight = wp_straight
         self.wp_turn = wp_turn
-        self.save_debug_map = save_debug_map
+        self.save_debug_map = save_debug_map or passive_mode
+        self.passive_mode = passive_mode
         self.visited_path = []
         self.planned_path = []
         self.smooth_x = None
@@ -247,9 +248,10 @@ class TestMoveThread(QThread):
             phys_joy_x = int(log_joy_x * self.scale)
             phys_joy_y = int(log_joy_y * self.scale)
 
-            print(f"DEBUG NAV: Clicking joystick at physical ({phys_joy_x}, {phys_joy_y}) (logical: {log_joy_x}, {log_joy_y})")
-            pyautogui.click(phys_joy_x, phys_joy_y)
-            time.sleep(0.8)
+            if not self.passive_mode:
+                print(f"DEBUG NAV: Clicking joystick at physical ({phys_joy_x}, {phys_joy_y}) (logical: {log_joy_x}, {log_joy_y})")
+                pyautogui.click(phys_joy_x, phys_joy_y)
+                time.sleep(0.8)
 
             # Загружаем маркер
             mark_img_full = cv2.imread(self.marker_path, cv2.IMREAD_UNCHANGED)
@@ -271,7 +273,8 @@ class TestMoveThread(QThread):
             max_duration = 30.0
 
             print("DEBUG NAV: Starting movement loop...")
-            pyautogui.mouseDown(phys_joy_x, phys_joy_y)
+            if not self.passive_mode:
+                pyautogui.mouseDown(phys_joy_x, phys_joy_y)
 
             path = []
             path_index = 0
@@ -305,8 +308,8 @@ class TestMoveThread(QThread):
 
                         # Координаты ног персонажа относительно региона (ЛОГИЧЕСКИЕ)
                         if self.centering_enabled:
-                            raw_rel_x = found_x_rel_log + (self.centering_offset[0] / self.scale)
-                            raw_rel_y = found_y_rel_log + (self.centering_offset[1] / self.scale)
+                            raw_rel_x = found_x_rel_log + self.centering_offset[0]
+                            raw_rel_y = found_y_rel_log + self.centering_offset[1]
                         else:
                             raw_rel_x = found_x_rel_log + (marker_w / self.scale) / 2
                             raw_rel_y = found_y_rel_log + (marker_h / self.scale) / 2
@@ -327,6 +330,11 @@ class TestMoveThread(QThread):
 
                         print(f"DEBUG NAV: Character at RegionLog({int(rel_x)}, {int(rel_y)})")
                         self.visited_path.append((rel_x, rel_y))
+
+                        # Если цель не задана (в ручном пассивном режиме), то пропускаем навигацию
+                        if self.target_pos is None:
+                            time.sleep(self.scan_interval)
+                            continue
 
                         # Определяем цель
                         if self.target_pos[0] > self.region["width"]:
@@ -391,20 +399,48 @@ class TestMoveThread(QThread):
                                 wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
                                 print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px, sharp_turn: {is_sharp_turn})")
 
+                            # Базовый вектор до вейпоинта
                             dx = waypoint[0] - rel_x
                             dy = waypoint[1] - rel_y
+
+                            # Применяем "Умное пробегание" (Look-ahead) для промежуточных точек
+                            if path_index < len(path) - 1:
+                                if path_index > 0:
+                                    prev_wp = path[path_index-1]
+                                else:
+                                    prev_wp = (rel_x, rel_y)
+                                
+                                seg_dx = waypoint[0] - prev_wp[0]
+                                seg_dy = waypoint[1] - prev_wp[1]
+                                seg_len = math.hypot(seg_dx, seg_dy)
+                                
+                                if seg_len > 0.1:
+                                    # Нормализованный вектор направления текущего коридора
+                                    ux = seg_dx / seg_len
+                                    uy = seg_dy / seg_len
+                                    
+                                    # Проектируем виртуальную цель на 2.0 пикселя дальше по вектору движения
+                                    overrun_dist = 2.0
+                                    target_x = waypoint[0] + ux * overrun_dist
+                                    target_y = waypoint[1] + uy * overrun_dist
+                                    
+                                    dx = target_x - rel_x
+                                    dy = target_y - rel_y
+
                             angle = math.atan2(dy, dx)
 
                             # Тянем джойстик на полную мощность без замедления, как запросил пользователь
-                            phys_radius = self.joy_settings['radius'] * self.scale
-                            drag_x_phys = phys_joy_x + math.cos(angle) * phys_radius
-                            drag_y_phys = phys_joy_y + math.sin(angle) * phys_radius
+                            if not self.passive_mode:
+                                phys_radius = self.joy_settings['radius'] * self.scale
+                                drag_x_phys = phys_joy_x + math.cos(angle) * phys_radius
+                                drag_y_phys = phys_joy_y + math.sin(angle) * phys_radius
 
-                            print(f"DEBUG NAV: Dragging joystick to physical: ({int(drag_x_phys)}, {int(drag_y_phys)}) [angle: {math.degrees(angle):.1f}°]")
-                            pyautogui.moveTo(int(drag_x_phys), int(drag_y_phys), duration=0.05)
+                                print(f"DEBUG NAV: Dragging joystick to physical: ({int(drag_x_phys)}, {int(drag_y_phys)}) [angle: {math.degrees(angle):.1f}°]")
+                                pyautogui.moveTo(int(drag_x_phys), int(drag_y_phys), duration=0.05)
                     time.sleep(self.scan_interval)
 
-            pyautogui.mouseUp()
+            if not self.passive_mode:
+                pyautogui.mouseUp()
             print("DEBUG: Поток движения завершен штатно")
             
         except Exception as e:
@@ -551,9 +587,9 @@ class AutoDetector(QThread):
                             found_y = y_reg + max_loc[1] / scale
                             
                             if self.centering_enabled:
-                                # Добавляем смещение центра относительно левого верхнего угла (переводя в логические пиксели)
-                                final_x = int(found_x + self.centering_offset[0] / scale)
-                                final_y = int(found_y + self.centering_offset[1] / scale)
+                                # Добавляем смещение центра относительно левого верхнего угла (в логических пикселях, соответствующих MapRecorder)
+                                final_x = int(found_x + self.centering_offset[0])
+                                final_y = int(found_y + self.centering_offset[1])
                             else:
                                 # Если центрирование выключено, используем центр самого маркера
                                 marker_h, marker_w = template.shape[:2]
@@ -1474,8 +1510,16 @@ class SettingsPage(QWidget):
         self.cb_save_debug_map.setStyleSheet("margin-top: 10px;")
         self.cb_save_debug_map.stateChanged.connect(lambda state: self.settings_obj.setValue("save_debug_map", state == 2))
         
+        self.btn_passive_record = QPushButton("🔍")
+        self.btn_passive_record.setToolTip("Пассивная запись траектории ручного бега")
+        self.btn_passive_record.setFixedSize(24, 24)
+        self.btn_passive_record.setStyleSheet("background-color: #f5c2e7; color: #11111b; font-weight: bold; border-radius: 4px; margin-top: 10px;")
+        self.btn_passive_record.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_passive_record.clicked.connect(self.run_passive_test_move)
+
         test_header_layout.addWidget(test_move_label)
         test_header_layout.addWidget(self.cb_save_debug_map)
+        test_header_layout.addWidget(self.btn_passive_record)
         test_header_layout.addStretch()
         
         self.test_coords_input = QLineEdit()
@@ -2608,6 +2652,81 @@ class SettingsPage(QWidget):
             (self.interactive_map.original_x, self.interactive_map.original_y),
             scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn,
             self.cb_save_debug_map.isChecked()
+        )
+        
+        def on_move_finished():
+            self.main_window.showNormal()
+            self.main_window.raise_()
+            self.main_window.activateWindow()
+            
+        def on_move_error(msg):
+            QMessageBox.warning(self, "Ошибка навигации", msg)
+            
+        self.move_thread.finished.connect(on_move_finished)
+        self.move_thread.error_occurred.connect(on_move_error)
+        self.move_thread.start()
+
+    def run_passive_test_move(self):
+        # 1. Проверяем, выбрана ли карта и есть ли данные проходимости
+        curr_item = self.maps_list_widget.currentItem()
+        if not curr_item:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите карту в списке!")
+            return
+            
+        map_name = curr_item.text()
+        map_path = os.path.join(ASSETS_DIR, "maps", map_name, "walkability.png")
+        if not os.path.exists(map_path):
+            QMessageBox.warning(self, "Ошибка", f"Для карты '{map_name}' нет данных проходимости!")
+            return
+
+        # 2. Проверяем координаты цели (опционально)
+        coords_text = self.test_coords_input.text().strip()
+        target_pos = None
+        if coords_text:
+            nums = re.findall(r'\d+', coords_text)
+            if len(nums) >= 2:
+                target_pos = (int(nums[0]), int(nums[1]))
+        
+        # 3. Ищем настройки джойстика
+        joy_settings = self.find_joystick_settings()
+        if not joy_settings:
+            QMessageBox.warning(self, "Ошибка", "Не найдены настройки джойстика! Добавьте в таблицу точку с названием 'Управление'.")
+            return
+
+        # 4. Регион миникарты
+        region_str = self.settings_obj.value("minimap_region", "", type=str)
+        if not region_str:
+            QMessageBox.warning(self, "Ошибка", "Регион миникарты не задан!")
+            return
+            
+        try:
+            x_reg, y_reg, w_reg, h_reg = map(int, region_str.split(","))
+            region = {"top": y_reg, "left": x_reg, "width": w_reg, "height": h_reg}
+        except:
+            return
+
+        # Сворачиваем окно
+        self.main_window.showMinimized()
+        
+        # Запускаем поток движения в пассивном режиме
+        screen = QApplication.primaryScreen()
+        scale = screen.devicePixelRatio() if screen else 1.0
+        marker_path = os.path.join(ASSETS_DIR, "mark.png")
+        threshold = float(self.settings_obj.value("match_threshold", "75")) / 100.0
+        
+        scan_interval = self.scan_interval_spin.value()
+        target_tolerance = self.target_tolerance_spin.value()
+        wall_offset = self.nav_offset_spin.value()
+        wp_straight = self.wp_straight_spin.value()
+        wp_turn = self.wp_turn_spin.value()
+        
+        self.move_thread = TestMoveThread(
+            target_pos, joy_settings, region, scale, marker_path, threshold,
+            self.cb_enable_centering.isChecked(),
+            (self.interactive_map.original_x, self.interactive_map.original_y),
+            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn,
+            save_debug_map=True,
+            passive_mode=True
         )
         
         def on_move_finished():
