@@ -356,13 +356,25 @@ class TestMoveThread(QThread):
                                 break
                             print(f"DEBUG NAV: Path planned successfully. Waypoints: {path}")
                             path_index = 0
+                            self.min_final_dist = 999.0
 
                         # Проверяем расстояние до финальной цели с учетом эффективной минимальной погрешности
                         effective_tolerance = max(0.0, self.target_tolerance)
                         final_dist = math.sqrt((target_rel_x - rel_x)**2 + (target_rel_y - rel_y)**2)
                         print(f"DEBUG NAV: Distance to final target: {final_dist:.2f} logical pixels (tolerance: {self.target_tolerance} px, effective: {effective_tolerance} px)")
+                        
+                        if not hasattr(self, 'min_final_dist'):
+                            self.min_final_dist = 999.0
+                        if final_dist < self.min_final_dist:
+                            self.min_final_dist = final_dist
+                        
                         if final_dist < effective_tolerance:
                             print(f"DEBUG NAV: Distance {final_dist:.2f} < effective tolerance {effective_tolerance}. Arrived! Breaking movement loop.")
+                            break
+                            
+                        # Если мы перелетели цель (расстояние начало увеличиваться после сближения)
+                        if self.min_final_dist < 3.0 and final_dist > self.min_final_dist + 0.5:
+                            print(f"DEBUG NAV: Overshot target (min was {self.min_final_dist:.2f}, now {final_dist:.2f}). Arrived! Breaking movement loop.")
                             break
 
                         if path_index < len(path):
@@ -393,18 +405,31 @@ class TestMoveThread(QThread):
                             # Для прямых участков допускаем больший срез для плавности хода.
                             current_wp_tolerance = self.wp_turn if is_sharp_turn else self.wp_straight
 
-                            if wp_dist < current_wp_tolerance and path_index < len(path) - 1:
+                            # Проекционный контроль прохождения вейпоинта (Dot Product Check)
+                            has_passed_waypoint = False
+                            if path_index < len(path) - 1:
+                                prev_wp = path[path_index-1] if path_index > 0 else self.planned_path[0]
+                                seg_dx = waypoint[0] - prev_wp[0]
+                                seg_dy = waypoint[1] - prev_wp[1]
+                                char_dx = rel_x - waypoint[0]
+                                char_dy = rel_y - waypoint[1]
+                                # Если dot > 0, персонаж пересек плоскость вейпоинта
+                                if (seg_dx * char_dx + seg_dy * char_dy) > 0:
+                                    has_passed_waypoint = True
+
+                            if (wp_dist < current_wp_tolerance or has_passed_waypoint) and path_index < len(path) - 1:
                                 path_index += 1
                                 waypoint = path[path_index]
                                 wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
-                                print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px, sharp_turn: {is_sharp_turn})")
+                                print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px, sharp_turn: {is_sharp_turn}, passed: {has_passed_waypoint})")
 
                             # Базовый вектор до вейпоинта
                             dx = waypoint[0] - rel_x
                             dy = waypoint[1] - rel_y
 
                             # Применяем "Умное пробегание" (Look-ahead) для промежуточных точек
-                            if path_index < len(path) - 1:
+                            enable_overrun = False
+                            if enable_overrun and path_index < len(path) - 1:
                                 if path_index > 0:
                                     prev_wp = path[path_index-1]
                                 else:
@@ -419,8 +444,8 @@ class TestMoveThread(QThread):
                                     ux = seg_dx / seg_len
                                     uy = seg_dy / seg_len
                                     
-                                    # Проектируем виртуальную цель на 2.0 пикселя дальше по вектору движения
-                                    overrun_dist = 2.0
+                                    # Проектируем виртуальную цель на 0.5 пикселя дальше по вектору движения
+                                    overrun_dist = 0.5
                                     target_x = waypoint[0] + ux * overrun_dist
                                     target_y = waypoint[1] + uy * overrun_dist
                                     
@@ -432,6 +457,12 @@ class TestMoveThread(QThread):
                             # Тянем джойстик на полную мощность без замедления, как запросил пользователь
                             if not self.passive_mode:
                                 phys_radius = self.joy_settings['radius'] * self.scale
+                                
+                                # Плавное замедление при приближении к финальной цели (чтобы не пролетать мимо и не крутиться)
+                                if final_dist < 8.0:
+                                    speed_factor = max(0.25, final_dist / 8.0)
+                                    phys_radius = phys_radius * speed_factor
+
                                 drag_x_phys = phys_joy_x + math.cos(angle) * phys_radius
                                 drag_y_phys = phys_joy_y + math.sin(angle) * phys_radius
 
