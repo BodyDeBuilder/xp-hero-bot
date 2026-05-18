@@ -222,6 +222,8 @@ class TestMoveThread(QThread):
         self.save_debug_map = save_debug_map
         self.visited_path = []
         self.planned_path = []
+        self.smooth_x = None
+        self.smooth_y = None
 
     def run(self):
         try:
@@ -303,11 +305,25 @@ class TestMoveThread(QThread):
 
                         # Координаты ног персонажа относительно региона (ЛОГИЧЕСКИЕ)
                         if self.centering_enabled:
-                            rel_x = found_x_rel_log + (self.centering_offset[0] / self.scale)
-                            rel_y = found_y_rel_log + (self.centering_offset[1] / self.scale)
+                            raw_rel_x = found_x_rel_log + (self.centering_offset[0] / self.scale)
+                            raw_rel_y = found_y_rel_log + (self.centering_offset[1] / self.scale)
                         else:
-                            rel_x = found_x_rel_log + (marker_w / self.scale) / 2
-                            rel_y = found_y_rel_log + (marker_h / self.scale) / 2
+                            raw_rel_x = found_x_rel_log + (marker_w / self.scale) / 2
+                            raw_rel_y = found_y_rel_log + (marker_h / self.scale) / 2
+
+                        # Применяем фильтр экспоненциального сглаживания (EMA) для устранения микро-джиттера (шума)
+                        if self.smooth_x is None:
+                            self.smooth_x = raw_rel_x
+                            self.smooth_y = raw_rel_y
+                        else:
+                            # alpha = 0.5 (смесь 50% новых координат и 50% предыдущего сглаженного тренда)
+                            # Это убирает ложное дребезжание координат, предотвращая преждевременные повороты
+                            alpha = 0.5
+                            self.smooth_x = alpha * raw_rel_x + (1 - alpha) * self.smooth_x
+                            self.smooth_y = alpha * raw_rel_y + (1 - alpha) * self.smooth_y
+
+                        rel_x = self.smooth_x
+                        rel_y = self.smooth_y
 
                         print(f"DEBUG NAV: Character at RegionLog({int(rel_x)}, {int(rel_y)})")
                         self.visited_path.append((rel_x, rel_y))
