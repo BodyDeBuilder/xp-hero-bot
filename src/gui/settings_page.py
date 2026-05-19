@@ -870,6 +870,16 @@ class SettingsPage(QWidget):
             self.migrate_chests_to_gifts()
             self.settings_obj.setValue("migrated_chests_to_gifts_v1", True)
 
+        # Миграция координат в подвкладку 3
+        if not self.settings_obj.value("migrated_to_subtabs_v1", False, type=bool):
+            self.migrate_to_subtabs()
+            self.settings_obj.setValue("migrated_to_subtabs_v1", True)
+
+        self.coords_subtabs_count = int(self.settings_obj.value("coords_subtabs_count", 3))
+        self.current_subtab_index = int(self.settings_obj.value("current_subtab_index", 3))
+        if self.current_subtab_index > self.coords_subtabs_count:
+            self.current_subtab_index = self.coords_subtabs_count
+
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(20, 20, 20, 20)
         self.layout.setSpacing(15)
@@ -994,6 +1004,35 @@ class SettingsPage(QWidget):
                 print(f"DEBUG: Миграция завершена. {len(chests_list)} точек перенесено из Сундуков в Подарки.")
         except Exception as e:
             print(f"DEBUG: Ошибка миграции: {e}")
+
+    def migrate_to_subtabs(self):
+        """Переносит все данные из bosses, chests, gifts в формат с индексом 3 и переименовывает скриншоты."""
+        tabs_to_migrate = ["bosses", "chests", "gifts"]
+        for tab in tabs_to_migrate:
+            old_key = f"coords_list_{tab}"
+            if self.settings_obj.contains(old_key):
+                new_key = f"coords_list_{tab}_3"
+                
+                # Переносим данные
+                data = self.settings_obj.value(old_key)
+                self.settings_obj.setValue(new_key, data)
+                
+                # Переименовываем скриншоты
+                try:
+                    coords = json.loads(data)
+                    for item in coords:
+                        name = item.get("name", "")
+                        if name:
+                            old_path = os.path.join(SCREENSHOTS_DIR, f"{tab}_{name}.png")
+                            new_path = os.path.join(SCREENSHOTS_DIR, f"{tab}_3_{name}.png")
+                            if os.path.exists(old_path) and not os.path.exists(new_path):
+                                os.rename(old_path, new_path)
+                                print(f"DEBUG: Renamed screenshot {old_path} -> {new_path}")
+                except Exception as e:
+                    print(f"DEBUG: Ошибка миграции скриншотов для {tab}: {e}")
+                    
+                self.settings_obj.remove(old_key)
+                print(f"DEBUG: Миграция {tab} завершена в подвкладку 3.")
 
     def save_to_history(self):
         # Сохраняем глубокую копию текущего списка
@@ -1261,11 +1300,28 @@ class SettingsPage(QWidget):
         self.coords_tabs_group.idClicked.connect(self.on_coords_tab_changed)
         
         coords_layout.addLayout(self.coords_tabs_layout)
+        
+        # --- Подвкладки (1, 2, 3...) ---
+        self.subtabs_container = QWidget()
+        sp = self.subtabs_container.sizePolicy()
+        sp.setRetainSizeWhenHidden(True)
+        self.subtabs_container.setSizePolicy(sp)
+        
+        self.subtabs_layout = QHBoxLayout(self.subtabs_container)
+        self.subtabs_layout.setContentsMargins(0, 0, 0, 0)
+        self.subtabs_layout.setSpacing(5)
+        self.subtabs_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        
+        self.subtabs_group = QButtonGroup(self)
+        self.subtabs_group.idClicked.connect(self.on_subtab_clicked)
+        
+        self.update_subtabs_ui()
+        coords_layout.addWidget(self.subtabs_container)
+        self.subtabs_container.hide() # По умолчанию скрыта (т.к. выбраны Кнопки)
+        
         coords_layout.addSpacing(10)
         
         header_layout = QHBoxLayout()
-        info_label = QLabel("Список локаций и зон для клика.")
-        info_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         
         self.undo_btn = QPushButton("Вернуть")
         self.undo_btn.setStyleSheet("""
@@ -1306,7 +1362,6 @@ class SettingsPage(QWidget):
         self.add_row_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_row_btn.clicked.connect(self.add_coord_row)
         
-        header_layout.addWidget(info_label)
         header_layout.addStretch()
         header_layout.addWidget(self.undo_btn)
         header_layout.addSpacing(10)
@@ -1633,7 +1688,7 @@ class SettingsPage(QWidget):
         maps_mgr_layout.addWidget(self.maps_list_widget)
         maps_mgr_layout.addLayout(maps_btns_layout)
         maps_mgr_layout.addLayout(preview_layout)
-        maps_mgr_layout.addLayout(test_move_layout) # Добавляем новый блок
+        maps_mgr_layout.addLayout(test_move_layout)
         maps_mgr_layout.addStretch()
         
         maps_layout.addLayout(maps_mgr_layout)
@@ -1726,6 +1781,131 @@ class SettingsPage(QWidget):
         # По умолчанию выбираем первую категорию
         self.category_list.setCurrentRow(0)
 
+    def on_coords_tab_changed(self, tab_id):
+        tab_keys = ["buttons", "bosses", "chests", "gifts"]
+        if 0 <= tab_id < len(tab_keys):
+            base_tab = tab_keys[tab_id]
+            if base_tab == "buttons":
+                self.subtabs_container.hide()
+                self.current_coords_tab = "buttons"
+            else:
+                self.subtabs_container.show()
+                self.current_coords_tab = f"{base_tab}_{self.current_subtab_index}"
+                self.update_subtabs_ui()
+                
+            self.load_coords()
+            # Если тест включен, обновляем его данные тоже
+            if self.test_btn.isChecked():
+                self.toggle_test_overlay(True)
+
+    def update_subtabs_ui(self):
+        print(f"DEBUG: update_subtabs_ui called. coords_subtabs_count = {self.coords_subtabs_count}")
+        # Очищаем старые кнопки
+        while self.subtabs_layout.count():
+            item = self.subtabs_layout.takeAt(0)
+            if item.widget():
+                if item.widget() in self.subtabs_group.buttons():
+                    self.subtabs_group.removeButton(item.widget())
+                item.widget().deleteLater()
+                
+        # Добавляем кнопки с номерами
+        print("DEBUG: Adding number buttons...")
+        for i in range(1, self.coords_subtabs_count + 1):
+            print(f"DEBUG: Adding button {i}")
+            btn = QPushButton(str(i))
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedSize(32, 32)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #181825;
+                    color: #cdd6f4;
+                    border: 2px solid #f9e2af;
+                    border-radius: 4px;
+                    font-weight: bold;
+                    font-size: 14px;
+                }
+                QPushButton:hover { background-color: #313244; }
+                QPushButton:checked {
+                    background-color: #f9e2af;
+                    color: #11111b;
+                }
+            """)
+            self.subtabs_group.addButton(btn, i)
+            self.subtabs_layout.addWidget(btn)
+            if i == self.current_subtab_index:
+                btn.setChecked(True)
+                
+        # Кнопка Плюс
+        print("DEBUG: Adding plus and minus buttons...")
+        plus_btn = QPushButton("+")
+        plus_btn.setFixedSize(32, 32)
+        plus_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        plus_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #181825; color: #a6e3a1; border: 2px solid #a6e3a1; border-radius: 4px; font-weight: bold; font-size: 18px;
+            }
+            QPushButton:hover { background-color: #313244; }
+        """)
+        plus_btn.clicked.connect(self.add_subtab)
+        self.subtabs_layout.addWidget(plus_btn)
+        
+        # Кнопка Минус
+        minus_btn = QPushButton("-")
+        minus_btn.setFixedSize(32, 32)
+        minus_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        minus_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #181825; color: #f38ba8; border: 2px solid #f38ba8; border-radius: 4px; font-weight: bold; font-size: 18px;
+            }
+            QPushButton:hover { background-color: #313244; }
+        """)
+        minus_btn.clicked.connect(self.remove_subtab)
+        self.subtabs_layout.addWidget(minus_btn)
+        
+        self.subtabs_layout.addStretch()
+        print(f"DEBUG: update_subtabs_ui finished. Layout count: {self.subtabs_layout.count()}")
+
+    def on_subtab_clicked(self, subtab_id):
+        self.current_subtab_index = subtab_id
+        self.settings_obj.setValue("current_subtab_index", subtab_id)
+        
+        # Обновляем ключ текущей вкладки (base_tab берем из главной вкладки)
+        tab_id = self.coords_tabs_group.checkedId()
+        tab_keys = ["buttons", "bosses", "chests", "gifts"]
+        if 1 <= tab_id < len(tab_keys):
+            self.current_coords_tab = f"{tab_keys[tab_id]}_{self.current_subtab_index}"
+            self.load_coords()
+
+    def add_subtab(self):
+        if self.coords_subtabs_count >= 10:
+            QMessageBox.information(self, "Лимит", "Достигнут лимит в 10 подвкладок.")
+            return
+        self.coords_subtabs_count += 1
+        self.settings_obj.setValue("coords_subtabs_count", self.coords_subtabs_count)
+        self.update_subtabs_ui()
+
+    def remove_subtab(self):
+        if self.coords_subtabs_count <= 1:
+            QMessageBox.warning(self, "Ошибка", "Нельзя удалить последнюю подвкладку!")
+            return
+            
+        # Удаляем данные последней вкладки для всех категорий
+        tab_keys = ["bosses", "chests", "gifts"]
+        for tab in tab_keys:
+            key_to_remove = f"coords_list_{tab}_{self.coords_subtabs_count}"
+            self.settings_obj.remove(key_to_remove)
+            
+        self.coords_subtabs_count -= 1
+        self.settings_obj.setValue("coords_subtabs_count", self.coords_subtabs_count)
+        
+        if self.current_subtab_index > self.coords_subtabs_count:
+            # Переключаемся на предыдущую если мы были на удаленной
+            self.subtabs_group.button(self.coords_subtabs_count).setChecked(True)
+            self.on_subtab_clicked(self.coords_subtabs_count)
+        else:
+            self.update_subtabs_ui()
+
     def on_threshold_changed(self, value):
         self.thresh_label.setText(f"Уверенность (Threshold): {value}%")
         self.settings_obj.setValue("match_threshold", str(value))
@@ -1754,14 +1934,6 @@ class SettingsPage(QWidget):
             self.insert_row_ui(row, target)
         self.coords_table.blockSignals(False)
 
-    def on_coords_tab_changed(self, tab_id):
-        tab_keys = ["buttons", "bosses", "chests", "gifts"]
-        if 0 <= tab_id < len(tab_keys):
-            self.current_coords_tab = tab_keys[tab_id]
-            self.load_coords()
-            # Если тест включен, обновляем его данными со всех вкладок
-            if self.test_btn.isChecked():
-                self.toggle_test_overlay(True)
 
     def pick_crosshair_color(self):
         color = QColorDialog.getColor(QColor(self.settings_obj.value("test_crosshair_color", "#ff0000")))
