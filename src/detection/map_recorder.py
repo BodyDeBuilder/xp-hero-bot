@@ -128,9 +128,9 @@ class MapRecorder(QThread):
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                     
                     if getattr(self, 'marker_mask', None) is not None:
-                        result = cv2.matchTemplate(img_rgb, self.marker_template, cv2.TM_CCORR_NORMED, mask=self.marker_mask)
+                        result = cv2.matchTemplate(img_rgb, self.marker_template, cv2.TM_CCOEFF_NORMED, mask=self.marker_mask)
                     else:
-                        result = cv2.matchTemplate(img_rgb, self.marker_template, cv2.TM_CCORR_NORMED)
+                        result = cv2.matchTemplate(img_rgb, self.marker_template, cv2.TM_CCOEFF_NORMED)
                     
                     _, max_val, _, max_loc = cv2.minMaxLoc(result)
                     

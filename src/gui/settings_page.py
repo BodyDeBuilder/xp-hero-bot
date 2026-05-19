@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSettings, pyqtSignal, QTimer, QPoint, QRect, QThread
 from PyQt6.QtGui import QPainter, QPen, QPixmap, QColor, QBrush, QImage, QAction, QKeySequence
 import os
+import shutil
 import json
 import time
 import mss
@@ -296,9 +297,9 @@ class TestMoveThread(QThread):
                     img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR).astype(np.uint8)
 
                     if mask is not None:
-                        res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCORR_NORMED, mask=mask)
+                        res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCOEFF_NORMED, mask=mask)
                     else:
-                        res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCORR_NORMED)
+                        res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCOEFF_NORMED)
 
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
@@ -630,9 +631,9 @@ class AutoDetector(QThread):
                         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
                         if mask is not None:
-                            res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCORR_NORMED, mask=mask)
+                            res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCOEFF_NORMED, mask=mask)
                         else:
-                            res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCORR_NORMED)
+                            res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCOEFF_NORMED)
 
                         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)                            
                         if max_val >= self.threshold:
@@ -1361,8 +1362,26 @@ class SettingsPage(QWidget):
         """)
         self.add_row_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_row_btn.clicked.connect(self.add_coord_row)
+        self.full_map_btn = QPushButton("Фулл карта")
+        self.full_map_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #cba6f7; 
+                color: #11111b; 
+                border-radius: 4px; 
+                padding: 6px 16px; 
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #b4befe;
+            }
+        """)
+        self.full_map_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.full_map_btn.clicked.connect(self.generate_and_show_full_map)
         
         header_layout.addStretch()
+        header_layout.addWidget(self.full_map_btn)
+        header_layout.addSpacing(10)
         header_layout.addWidget(self.undo_btn)
         header_layout.addSpacing(10)
         header_layout.addWidget(self.add_row_btn)
@@ -1762,6 +1781,24 @@ class SettingsPage(QWidget):
         self.early_stop_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.early_stop_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_early_stop", v))
         
+        # Смещение точек по X на карте
+        map_shift_x_label = QLabel("Смещение точек по X на карте (px):")
+        map_shift_x_label.setStyleSheet("font-size: 14px;")
+        self.map_shift_x_spin = QSpinBox()
+        self.map_shift_x_spin.setRange(-100, 100)
+        self.map_shift_x_spin.setValue(self.settings_obj.value("map_draw_shift_x", 10, type=int))
+        self.map_shift_x_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.map_shift_x_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("map_draw_shift_x", v))
+        
+        # Смещение точек по Y на карте
+        map_shift_y_label = QLabel("Смещение точек по Y на карте (px):")
+        map_shift_y_label.setStyleSheet("font-size: 14px;")
+        self.map_shift_y_spin = QSpinBox()
+        self.map_shift_y_spin.setRange(-100, 100)
+        self.map_shift_y_spin.setValue(self.settings_obj.value("map_draw_shift_y", 0, type=int))
+        self.map_shift_y_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.map_shift_y_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("map_draw_shift_y", v))
+        
         move_grid.addWidget(scan_label, 0, 0)
         move_grid.addWidget(self.scan_interval_spin, 0, 1)
         move_grid.addWidget(target_tol_label, 1, 0)
@@ -1772,6 +1809,10 @@ class SettingsPage(QWidget):
         move_grid.addWidget(self.wp_turn_spin, 3, 1)
         move_grid.addWidget(early_stop_label, 4, 0)
         move_grid.addWidget(self.early_stop_spin, 4, 1)
+        move_grid.addWidget(map_shift_x_label, 5, 0)
+        move_grid.addWidget(self.map_shift_x_spin, 5, 1)
+        move_grid.addWidget(map_shift_y_label, 6, 0)
+        move_grid.addWidget(self.map_shift_y_spin, 6, 1)
         
         move_layout.addLayout(move_grid)
         move_layout.addStretch()
@@ -1787,9 +1828,11 @@ class SettingsPage(QWidget):
             base_tab = tab_keys[tab_id]
             if base_tab == "buttons":
                 self.subtabs_container.hide()
+                if hasattr(self, 'full_map_btn'): self.full_map_btn.hide()
                 self.current_coords_tab = "buttons"
             else:
                 self.subtabs_container.show()
+                if hasattr(self, 'full_map_btn'): self.full_map_btn.show()
                 self.current_coords_tab = f"{base_tab}_{self.current_subtab_index}"
                 self.update_subtabs_ui()
                 
@@ -2161,6 +2204,116 @@ class SettingsPage(QWidget):
             except Exception as e:
                 print(f"Error renaming screenshot: {e}")
 
+    def generate_and_show_full_map(self):
+        if self.current_coords_tab == "buttons":
+            return
+            
+        base_tab_parts = self.current_coords_tab.split('_')
+        base_tab = base_tab_parts[0]
+        subtab = base_tab_parts[1] if len(base_tab_parts) > 1 else "1"
+        
+        # 1. Автоматически находим папку оригинальной карты по номеру подвкладки (например, "3" -> "Глава 3")
+        map_name = None
+        maps_root = os.path.join(ASSETS_DIR, "maps")
+        if os.path.exists(maps_root):
+            for d in os.listdir(maps_root):
+                if os.path.isdir(os.path.join(maps_root, d)):
+                    if subtab in d:
+                        map_name = d
+                        break
+                        
+        if not map_name:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось автоматически найти папку карты для главы {subtab} в папке assets/maps! Создайте и задайте регион карты сначала.")
+            return
+            
+        map_dir = os.path.join(ASSETS_DIR, "maps", map_name)
+        original_map_path = os.path.join(map_dir, "map_original.png")
+        region_info_path = os.path.join(map_dir, "region.json")
+        
+        if not os.path.exists(original_map_path) or not os.path.exists(region_info_path):
+            QMessageBox.warning(self, "Ошибка", f"В папке карты '{map_name}' не найден файл map_original.png или region.json!")
+            return
+            
+        try:
+            # 2. Загружаем регион и масштаб
+            with open(region_info_path, "r") as f:
+                region = json.load(f)
+                
+            scale = region.get("scale", 1.0)
+            
+            # 3. Загружаем чистый оригинальный полноэкранный скриншот безопасным способом (поддержка кириллицы)
+            with open(original_map_path, "rb") as f:
+                chunk = np.frombuffer(f.read(), dtype=np.uint8)
+                base_img = cv2.imdecode(chunk, cv2.IMREAD_COLOR)
+                
+            if base_img is None:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось прочитать {original_map_path}")
+                return
+                
+            # 4. Рисуем зеленые закрашенные кружки с названиями точек внутри
+            # Установим комфортный радиус для размещения текста внутри (8 логических пикселей -> диаметр 24 физических)
+            circle_radius = int(8 * scale)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.26
+            font_thickness = 1
+            
+            shift_x = int(self.settings_obj.value("map_draw_shift_x", 10, type=int))
+            shift_y = int(self.settings_obj.value("map_draw_shift_y", 0, type=int))
+            
+            for t in self.coords_list:
+                x, y = t.get("x", 0), t.get("y", 0)
+                name = t.get("name", "")
+                
+                # Переводим логические координаты в физические на полноэкранной карте (с учетом компенсации DWM)
+                img_x = round((x + shift_x) * scale)
+                img_y = round((y + shift_y) * scale)
+                
+                # Рисуем красивый закрашенный зеленый кружок
+                cv2.circle(base_img, (img_x, img_y), circle_radius, (120, 220, 120), -1)
+                # Рисуем аккуратную темно-зеленую обводку
+                cv2.circle(base_img, (img_x, img_y), circle_radius, (40, 120, 40), 1)
+                
+                # Вычисляем точный размер текста для идеального центрирования внутри круга
+                text_size = cv2.getTextSize(name, font, font_scale, font_thickness)[0]
+                text_w, text_h = text_size[0], text_size[1]
+                
+                # Центрируем текст по осям X и Y
+                tx = img_x - text_w // 2
+                ty = img_y + text_h // 2
+                
+                # Пишем текст черным цветом
+                cv2.putText(base_img, name, (tx, ty), font, font_scale, (0, 0, 0), font_thickness, cv2.LINE_AA)
+                
+            # 5. Обрезаем картинку по региону миникарты из region.json
+            rx = int(region["x"] * scale)
+            ry = int(region["y"] * scale)
+            rw = int(region["w"] * scale)
+            rh = int(region["h"] * scale)
+            
+            y2 = min(base_img.shape[0], ry + rh)
+            x2 = min(base_img.shape[1], rx + rw)
+            
+            cropped_img = base_img[ry:y2, rx:x2]
+            
+            # 6. Сохраняем готовую красивую карту безопасным способом (поддержка кириллицы)
+            collective_dir = os.path.join(ASSETS_DIR, "collective image", subtab)
+            os.makedirs(collective_dir, exist_ok=True)
+            out_path = os.path.join(collective_dir, f"{base_tab}.png")
+            
+            is_success, buffer = cv2.imencode(".png", cropped_img)
+            if is_success:
+                with open(out_path, "wb") as f:
+                    f.write(buffer)
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось закодировать итоговое изображение!")
+                return
+            
+            # 7. Отображение убрано по просьбе пользователя (работа в тихом режиме)
+            pass
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сгенерировать карту из оригинала: {e}")
+
     def save_coords(self, *args):
         # Обновляем self.coords_list из UI
         new_list = []
@@ -2173,19 +2326,21 @@ class SettingsPage(QWidget):
             if not name_item or not coord_item or not spinbox:
                 continue
                 
-            old_target = self.coords_list[row] if row < len(self.coords_list) else {}
             new_name = name_item.text()
+            old_name = name_item.data(Qt.ItemDataRole.UserRole)
             
             # Если имя изменилось, переименовываем скриншот
-            if "name" in old_target and old_target["name"] != new_name:
+            if old_name and old_name != new_name:
                 self.save_to_history()
-                self.rename_screenshot(old_target["name"], new_name)
+                self.rename_screenshot(old_name, new_name)
+                # Обновляем сохраненное старое имя, чтобы не переименовывать повторно
+                name_item.setData(Qt.ItemDataRole.UserRole, new_name)
             
             # Парсим координаты из текста ячейки (на случай Ctrl+V)
             coord_text = coord_item.text()
             nums = re.findall(r'\d+', coord_text)
-            x = int(nums[0]) if len(nums) >= 1 else old_target.get("x", 0)
-            y = int(nums[1]) if len(nums) >= 2 else old_target.get("y", 0)
+            x = int(nums[0]) if len(nums) >= 1 else 0
+            y = int(nums[1]) if len(nums) >= 2 else 0
             
             target = {
                 "name": new_name,
@@ -2305,6 +2460,7 @@ class SettingsPage(QWidget):
         
         # 1 колонка: Название
         name_item = QTableWidgetItem(target.get("name", ""))
+        name_item.setData(Qt.ItemDataRole.UserRole, target.get("name", ""))
         self.coords_table.setItem(row, 0, name_item)
         
         # 2 колонка: Координаты
@@ -2486,9 +2642,9 @@ class SettingsPage(QWidget):
                     continue
                 
                 if mask is not None:
-                    result = cv2.matchTemplate(img_rgb, marker_template, cv2.TM_CCORR_NORMED, mask=mask)
+                    result = cv2.matchTemplate(img_rgb, marker_template, cv2.TM_CCOEFF_NORMED, mask=mask)
                 else:
-                    result = cv2.matchTemplate(img_rgb, marker_template, cv2.TM_CCORR_NORMED)
+                    result = cv2.matchTemplate(img_rgb, marker_template, cv2.TM_CCOEFF_NORMED)
                     
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
                 
@@ -2659,10 +2815,15 @@ class SettingsPage(QWidget):
                         shutil.rmtree(map_dir)
                         print(f"DEBUG: Папка {map_dir} удалена")
                     except Exception as e:
-                        QMessageBox.warning(self, "Ошибка удаления", f"Не удалось удалить папку {name}: {e}")
+                        QMessageBox.warning(self, "Ошибка удаления", 
+                                             f"Не удалось удалить файлы карты '{name}'.\n"
+                                             f"Пожалуйста, убедитесь, что картинки карты не открыты в сторонних программах (например, в Просмотре фотографий Windows)!\n\n"
+                                             f"Детали ошибки: {e}")
+                        return # Прерываем выполнение, оставляя карту в списке для повторной попытки
 
-                # 2. Удаляем из настроек
-                self.maps.remove(name)
+                # 2. Удаляем из настроек только при успешном физическом удалении
+                if name in self.maps:
+                    self.maps.remove(name)
                 self.settings_obj.setValue("maps_list", json.dumps(self.maps))
                 self.load_maps_list()
                 self.map_preview_label.setText("Выберите карту для предпросмотра")
