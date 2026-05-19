@@ -203,7 +203,7 @@ class TestMoveThread(QThread):
     finished = Signal()
     error_occurred = Signal(str)
 
-    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8, save_debug_map=False, passive_mode=False):
+    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8, early_stop=0.0, save_debug_map=False, passive_mode=False):
         super().__init__()
         self.target_pos = target_pos # (x, y)
         self.joy_settings = joy_settings # {x, y, radius}
@@ -219,6 +219,7 @@ class TestMoveThread(QThread):
         self.wall_offset = wall_offset
         self.wp_straight = wp_straight
         self.wp_turn = wp_turn
+        self.early_stop = early_stop
         self.save_debug_map = save_debug_map or passive_mode
         self.passive_mode = passive_mode
         self.visited_path = []
@@ -358,18 +359,18 @@ class TestMoveThread(QThread):
                             path_index = 0
                             self.min_final_dist = 999.0
 
-                        # Проверяем расстояние до финальной цели с учетом эффективной минимальной погрешности
+                        # Проверяем расстояние до финальной цели с учетом эффективной минимальной погрешности и ранней остановки
                         effective_tolerance = max(0.0, self.target_tolerance)
                         final_dist = math.sqrt((target_rel_x - rel_x)**2 + (target_rel_y - rel_y)**2)
-                        print(f"DEBUG NAV: Distance to final target: {final_dist:.2f} logical pixels (tolerance: {self.target_tolerance} px, effective: {effective_tolerance} px)")
+                        print(f"DEBUG NAV: Distance to final target: {final_dist:.2f} logical pixels (tolerance: {self.target_tolerance} px, effective: {effective_tolerance} px, early_stop: {self.early_stop} px)")
                         
                         if not hasattr(self, 'min_final_dist'):
                             self.min_final_dist = 999.0
                         if final_dist < self.min_final_dist:
                             self.min_final_dist = final_dist
                         
-                        if final_dist < effective_tolerance:
-                            print(f"DEBUG NAV: Distance {final_dist:.2f} < effective tolerance {effective_tolerance}. Arrived! Breaking movement loop.")
+                        if final_dist <= max(effective_tolerance, self.early_stop):
+                            print(f"DEBUG NAV: Distance {final_dist:.2f} <= early stop threshold {max(effective_tolerance, self.early_stop)}. Arrived! Breaking movement loop.")
                             break
                             
                         # Если мы перелетели цель (расстояние начало увеличиваться после сближения)
@@ -1696,6 +1697,16 @@ class SettingsPage(QWidget):
         self.wp_turn_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.wp_turn_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_wp_turn", v))
         
+        early_stop_label = QLabel("Тормозной путь (ранняя остановка, px):")
+        early_stop_label.setStyleSheet("font-size: 14px;")
+        self.early_stop_spin = QDoubleSpinBox()
+        self.early_stop_spin.setRange(0.0, 20.0)
+        self.early_stop_spin.setSingleStep(0.5)
+        self.early_stop_spin.setDecimals(1)
+        self.early_stop_spin.setValue(float(self.settings_obj.value("nav_early_stop", 0.0)))
+        self.early_stop_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.early_stop_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_early_stop", v))
+        
         move_grid.addWidget(scan_label, 0, 0)
         move_grid.addWidget(self.scan_interval_spin, 0, 1)
         move_grid.addWidget(target_tol_label, 1, 0)
@@ -1704,6 +1715,8 @@ class SettingsPage(QWidget):
         move_grid.addWidget(self.wp_straight_spin, 2, 1)
         move_grid.addWidget(wp_turn_label, 3, 0)
         move_grid.addWidget(self.wp_turn_spin, 3, 1)
+        move_grid.addWidget(early_stop_label, 4, 0)
+        move_grid.addWidget(self.early_stop_spin, 4, 1)
         
         move_layout.addLayout(move_grid)
         move_layout.addStretch()
@@ -2703,12 +2716,13 @@ class SettingsPage(QWidget):
         wall_offset = self.nav_offset_spin.value()
         wp_straight = self.wp_straight_spin.value()
         wp_turn = self.wp_turn_spin.value()
+        early_stop = self.early_stop_spin.value()
         
         self.move_thread = TestMoveThread(
             target_pos, joy_settings, region, scale, marker_path, threshold,
             self.cb_enable_centering.isChecked(),
             (self.interactive_map.original_x, self.interactive_map.original_y),
-            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn,
+            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn, early_stop,
             self.cb_save_debug_map.isChecked()
         )
         
@@ -2777,12 +2791,13 @@ class SettingsPage(QWidget):
         wall_offset = self.nav_offset_spin.value()
         wp_straight = self.wp_straight_spin.value()
         wp_turn = self.wp_turn_spin.value()
+        early_stop = self.early_stop_spin.value()
         
         self.move_thread = TestMoveThread(
             target_pos, joy_settings, region, scale, marker_path, threshold,
             self.cb_enable_centering.isChecked(),
             (self.interactive_map.original_x, self.interactive_map.original_y),
-            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn,
+            scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn, early_stop,
             save_debug_map=True,
             passive_mode=True
         )
