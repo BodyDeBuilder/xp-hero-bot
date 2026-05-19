@@ -423,34 +423,61 @@ class TestMoveThread(QThread):
                                 wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
                                 print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px, sharp_turn: {is_sharp_turn}, passed: {has_passed_waypoint})")
 
-                            # Базовый вектор до вейпоинта
-                            dx = waypoint[0] - rel_x
-                            dy = waypoint[1] - rel_y
-
-                            # Применяем "Умное пробегание" (Look-ahead) для промежуточных точек
-                            enable_overrun = False
-                            if enable_overrun and path_index < len(path) - 1:
-                                if path_index > 0:
-                                    prev_wp = path[path_index-1]
+                            # --- Алгоритм "Виртуальная Морковка" (Pure Pursuit) ---
+                            # Дистанция взгляда вперед (в логических пикселях). Чем больше, тем плавнее повороты.
+                            lookahead = 4.0 
+                            
+                            carrot_x = waypoint[0]
+                            carrot_y = waypoint[1]
+                            
+                            # Если мы еще не достигли финальной точки, рассчитываем морковку вдоль пути
+                            if path_index < len(path) - 1:
+                                remaining_lookahead = lookahead
+                                curr_pt = (rel_x, rel_y)
+                                
+                                # Расстояние до ближайшего целевого вейпоинта
+                                dist_to_wp = math.hypot(waypoint[0] - rel_x, waypoint[1] - rel_y)
+                                
+                                if dist_to_wp >= remaining_lookahead:
+                                    # Морковка лежит на отрезке между персонажем и текущим вейпоинтом
+                                    if dist_to_wp > 0.1:
+                                        ux = (waypoint[0] - rel_x) / dist_to_wp
+                                        uy = (waypoint[1] - rel_y) / dist_to_wp
+                                        carrot_x = rel_x + ux * remaining_lookahead
+                                        carrot_y = rel_y + uy * remaining_lookahead
                                 else:
-                                    prev_wp = (rel_x, rel_y)
-                                
-                                seg_dx = waypoint[0] - prev_wp[0]
-                                seg_dy = waypoint[1] - prev_wp[1]
-                                seg_len = math.hypot(seg_dx, seg_dy)
-                                
-                                if seg_len > 0.1:
-                                    # Нормализованный вектор направления текущего коридора
-                                    ux = seg_dx / seg_len
-                                    uy = seg_dy / seg_len
+                                    # Морковка "сворачивает за угол" на следующие сегменты
+                                    remaining_lookahead -= dist_to_wp
+                                    curr_pt = waypoint
                                     
-                                    # Проектируем виртуальную цель на 0.5 пикселя дальше по вектору движения
-                                    overrun_dist = 0.5
-                                    target_x = waypoint[0] + ux * overrun_dist
-                                    target_y = waypoint[1] + uy * overrun_dist
-                                    
-                                    dx = target_x - rel_x
-                                    dy = target_y - rel_y
+                                    # Идем по оставшимся сегментам пути
+                                    for i in range(path_index, len(path) - 1):
+                                        next_pt = path[i+1]
+                                        seg_dx = next_pt[0] - curr_pt[0]
+                                        seg_dy = next_pt[1] - curr_pt[1]
+                                        seg_len = math.hypot(seg_dx, seg_dy)
+                                        
+                                        if remaining_lookahead <= seg_len:
+                                            # Морковка лежит на этом сегменте
+                                            if seg_len > 0.1:
+                                                ux = seg_dx / seg_len
+                                                uy = seg_dy / seg_len
+                                                carrot_x = curr_pt[0] + ux * remaining_lookahead
+                                                carrot_y = curr_pt[1] + uy * remaining_lookahead
+                                            remaining_lookahead = 0
+                                            break
+                                        else:
+                                            # Морковка лежит еще дальше
+                                            remaining_lookahead -= seg_len
+                                            curr_pt = next_pt
+                                            
+                                    # Если мы исчерпали путь, а lookahead остался, морковка — это финальная точка
+                                    if remaining_lookahead > 0:
+                                        carrot_x = path[-1][0]
+                                        carrot_y = path[-1][1]
+                                        
+                            dx = carrot_x - rel_x
+                            dy = carrot_y - rel_y
 
                             angle = math.atan2(dy, dx)
 
