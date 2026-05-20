@@ -19,6 +19,52 @@ import re
 import math
 import ctypes
 
+class HelpPopup(QDialog):
+    def __init__(self, parent, title, text):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Popup)
+        
+        # Стилизация под темную тему с фиолетовой рамкой и закругленными углами
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e2e;
+                border: 2px solid #cba6f7;
+                border-radius: 8px;
+            }
+            QLabel {
+                color: #cdd6f4;
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(8)
+        
+        title_label = QLabel(f"<b>{title}</b>")
+        title_label.setStyleSheet("font-size: 16px; color: #f9e2af; font-weight: bold;")
+        title_label.setWordWrap(True)
+        layout.addWidget(title_label)
+        
+        desc_label = QLabel(text)
+        desc_label.setWordWrap(True)
+        desc_label.setStyleSheet("font-size: 14px; line-height: 1.35;")
+        layout.addWidget(desc_label)
+        
+        self.setMinimumWidth(350)
+        self.setMaximumWidth(400)
+        
+        # Центрируем относительно родителя
+        if parent:
+            self.adjustSize()
+            parent_rect = parent.rect()
+            global_center = parent.mapToGlobal(parent_rect.center())
+            self.move(global_center.x() - self.width() // 2, global_center.y() - self.height() // 2)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.accept()
+
 class GlobalHotkeyThread(QThread):
     hotkey_triggered = pyqtSignal()
     
@@ -204,7 +250,7 @@ class TestMoveThread(QThread):
     finished = Signal()
     error_occurred = Signal(str)
 
-    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8, early_stop=0.0, save_debug_map=False, passive_mode=False):
+    def __init__(self, target_pos, joy_settings, region, scale, marker_path, threshold, centering_enabled, centering_offset, scan_interval_ms, target_tolerance, map_path, wall_offset, wp_straight=4.0, wp_turn=1.8, early_stop=0.0, save_debug_map=False, passive_mode=False, lookahead_straight=5.5, lookahead_turn_min=1.5, stop_turn_pause=150):
         super().__init__()
         self.target_pos = target_pos # (x, y)
         self.joy_settings = joy_settings # {x, y, radius}
@@ -223,6 +269,9 @@ class TestMoveThread(QThread):
         self.early_stop = early_stop
         self.save_debug_map = save_debug_map or passive_mode
         self.passive_mode = passive_mode
+        self.lookahead_straight = lookahead_straight
+        self.lookahead_turn_min = lookahead_turn_min
+        self.stop_turn_pause = stop_turn_pause / 1000.0
         self.visited_path = []
         self.planned_path = []
         self.smooth_x = None
@@ -304,33 +353,71 @@ class TestMoveThread(QThread):
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
                     if max_val >= self.threshold:
-                        # Логические координаты ПЕРЕДНЕГО ВЕРХНЕГО УГЛА МАРКЕРА относительно захваченного региона
-                        found_x_rel_log = max_loc[0] / self.scale
-                        found_y_rel_log = max_loc[1] / self.scale
-
-                        # Координаты ног персонажа относительно региона (ЛОГИЧЕСКИЕ)
+                            # Определяем координаты цели для динамического сглаживания
+                        raw_target_rel_x = 0
+                        raw_target_rel_y = 0
+                        if self.target_pos is not None:
+                            if self.target_pos[0] > self.region["width"]:
+                                raw_target_rel_x = self.target_pos[0] - self.region["left"]
+                                raw_target_rel_y = self.target_pos[1] - self.region["top"]
+                            else:
+                                raw_target_rel_x = self.target_pos[0]
+                                raw_target_rel_y = self.target_pos[1]
+                        
+                        raw_rel_x = max_loc[0] / self.scale + (marker_w / self.scale) / 2
+                        raw_rel_y = max_loc[1] / self.scale + (marker_h / self.scale) / 2
                         if self.centering_enabled:
-                            raw_rel_x = found_x_rel_log + self.centering_offset[0]
-                            raw_rel_y = found_y_rel_log + self.centering_offset[1]
-                        else:
-                            raw_rel_x = found_x_rel_log + (marker_w / self.scale) / 2
-                            raw_rel_y = found_y_rel_log + (marker_h / self.scale) / 2
+                            raw_rel_x = max_loc[0] / self.scale + self.centering_offset[0]
+                            raw_rel_y = max_loc[1] / self.scale + self.centering_offset[1]
+                        
+                        raw_final_dist = math.sqrt((raw_target_rel_x - raw_rel_x)**2 + (raw_target_rel_y - raw_rel_y)**2) if self.target_pos else 999.0
+
+                        # Определяем, является ли предстоящий поворот крутым для динамического сглаживания
+                        is_sharp_turn = False
+                        wp_dist = 999.0
+                        if path and path_index < len(path):
+                            waypoint = path[path_index]
+                            wp_dist = math.hypot(waypoint[0] - raw_rel_x, waypoint[1] - raw_rel_y)
+                            if path_index < len(path) - 1:
+                                if path_index > 0:
+                                    prev_wp = path[path_index-1]
+                                    curr_dx = waypoint[0] - prev_wp[0]
+                                    curr_dy = waypoint[1] - prev_wp[1]
+                                else:
+                                    curr_dx = waypoint[0] - raw_rel_x
+                                    curr_dy = waypoint[1] - raw_rel_y
+                                next_dx = path[path_index+1][0] - waypoint[0]
+                                next_dy = path[path_index+1][1] - waypoint[1]
+                                curr_len = math.hypot(curr_dx, curr_dy)
+                                next_len = math.hypot(next_dx, next_dy)
+                                if curr_len > 0.1 and next_len > 0.1:
+                                    dot_product = (curr_dx * next_dx + curr_dy * next_dy) / (curr_len * next_len)
+                                    if dot_product < 0.7:  # cos(45°) ≈ 0.707
+                                        is_sharp_turn = True
 
                         # Применяем фильтр экспоненциального сглаживания (EMA) для устранения микро-джиттера (шума)
+                        alpha = 1.0
                         if self.smooth_x is None:
                             self.smooth_x = raw_rel_x
                             self.smooth_y = raw_rel_y
                         else:
-                            # alpha = 0.5 (смесь 50% новых координат и 50% предыдущего сглаженного тренда)
-                            # Это убирает ложное дребезжание координат, предотвращая преждевременные повороты
+                            # Динамический коэффициент сглаживания (alpha): снижаем сглаживание (альфа к 1.0) при приближении к финишу или поворотам
                             alpha = 0.5
+                            if raw_final_dist < 15.0:
+                                # Плавный переход от 0.5 (на 15px) до 1.0 (на финише) для полной ликвидации лага координат
+                                alpha = 1.0 - (raw_final_dist / 15.0) * 0.5
+                            elif is_sharp_turn and wp_dist < 10.0:
+                                # Снижаем задержку координат при приближении к резким углам
+                                alpha = 1.0 - (wp_dist / 10.0) * 0.5
+                                
+                            alpha = max(0.5, min(1.0, alpha))
                             self.smooth_x = alpha * raw_rel_x + (1 - alpha) * self.smooth_x
                             self.smooth_y = alpha * raw_rel_y + (1 - alpha) * self.smooth_y
 
                         rel_x = self.smooth_x
                         rel_y = self.smooth_y
 
-                        print(f"DEBUG NAV: Character at RegionLog({int(rel_x)}, {int(rel_y)})")
+                        print(f"DEBUG NAV: Character at RegionLog({int(rel_x)}, {int(rel_y)}) (alpha: {alpha:.2f})")
                         self.visited_path.append((rel_x, rel_y))
 
                         # Если цель не задана (в ручном пассивном режиме), то пропускаем навигацию
@@ -339,12 +426,8 @@ class TestMoveThread(QThread):
                             continue
 
                         # Определяем цель
-                        if self.target_pos[0] > self.region["width"]:
-                            target_rel_x = self.target_pos[0] - self.region["left"]
-                            target_rel_y = self.target_pos[1] - self.region["top"]
-                        else:
-                            target_rel_x = self.target_pos[0]
-                            target_rel_y = self.target_pos[1]
+                        target_rel_x = raw_target_rel_x
+                        target_rel_y = raw_target_rel_y
 
                         print(f"DEBUG NAV: Target logical relative: ({int(target_rel_x)}, {int(target_rel_y)})")
 
@@ -363,7 +446,6 @@ class TestMoveThread(QThread):
                         # Проверяем расстояние до финальной цели с учетом эффективной минимальной погрешности и ранней остановки
                         effective_tolerance = max(0.0, self.target_tolerance)
                         final_dist = math.sqrt((target_rel_x - rel_x)**2 + (target_rel_y - rel_y)**2)
-                        print(f"DEBUG NAV: Distance to final target: {final_dist:.2f} logical pixels (tolerance: {self.target_tolerance} px, effective: {effective_tolerance} px, early_stop: {self.early_stop} px)")
                         
                         if not hasattr(self, 'min_final_dist'):
                             self.min_final_dist = 999.0
@@ -381,36 +463,14 @@ class TestMoveThread(QThread):
 
                         if path_index < len(path):
                             waypoint = path[path_index]
-                            wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
-                            print(f"DEBUG NAV: Heading to waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px)")
-
-                            # Определяем, является ли поворот крутым (угол > ~45 градусов)
-                            is_sharp_turn = False
-                            if path_index < len(path) - 1:
-                                if path_index > 0:
-                                    prev_wp = path[path_index-1]
-                                    curr_dx = waypoint[0] - prev_wp[0]
-                                    curr_dy = waypoint[1] - prev_wp[1]
-                                else:
-                                    curr_dx = waypoint[0] - rel_x
-                                    curr_dy = waypoint[1] - rel_y
-                                next_dx = path[path_index+1][0] - waypoint[0]
-                                next_dy = path[path_index+1][1] - waypoint[1]
-                                curr_len = math.hypot(curr_dx, curr_dy)
-                                next_len = math.hypot(next_dx, next_dy)
-                                if curr_len > 0.1 and next_len > 0.1:
-                                    dot_product = (curr_dx * next_dx + curr_dy * next_dy) / (curr_len * next_len)
-                                    if dot_product < 0.7:  # cos(45°) ≈ 0.707
-                                        is_sharp_turn = True
                             
                             # Для крутых поворотов требуем подойти вплотную, чтобы не срезать угол по диагонали прямо в стену.
-                            # Для прямых участков допускаем больший срез для плавности хода.
                             current_wp_tolerance = self.wp_turn if is_sharp_turn else self.wp_straight
 
                             # Проекционный контроль прохождения вейпоинта (Dot Product Check)
                             has_passed_waypoint = False
                             if path_index < len(path) - 1:
-                                prev_wp = path[path_index-1] if path_index > 0 else self.planned_path[0]
+                                prev_wp = path[path_index-1] if path_index > 0 else (rel_x, rel_y)
                                 seg_dx = waypoint[0] - prev_wp[0]
                                 seg_dy = waypoint[1] - prev_wp[1]
                                 char_dx = rel_x - waypoint[0]
@@ -419,15 +479,34 @@ class TestMoveThread(QThread):
                                 if (seg_dx * char_dx + seg_dy * char_dy) > 0:
                                     has_passed_waypoint = True
 
-                            if (wp_dist < current_wp_tolerance or has_passed_waypoint) and path_index < len(path) - 1:
+                            # Строгий контроль углов: на крутых поворотах игнорируем проекционный срез плоскости
+                            if is_sharp_turn:
+                                can_switch = wp_dist < current_wp_tolerance
+                            else:
+                                can_switch = wp_dist < current_wp_tolerance or has_passed_waypoint
+
+                            if can_switch and path_index < len(path) - 1:
+                                # Микро-остановка перед поворотом (Stop-and-Turn)
+                                if is_sharp_turn and not self.passive_mode and self.stop_turn_pause > 0.0:
+                                    print(f"DEBUG NAV: Sharp turn waypoint reached! Stopping character for {int(self.stop_turn_pause*1000)}ms to eliminate drift...")
+                                    pyautogui.mouseUp()
+                                    time.sleep(self.stop_turn_pause)
+                                    # Заново зажимаем джойстик в центре
+                                    pyautogui.mouseDown(phys_joy_x, phys_joy_y)
+
                                 path_index += 1
                                 waypoint = path[path_index]
                                 wp_dist = math.sqrt((waypoint[0] - rel_x)**2 + (waypoint[1] - rel_y)**2)
                                 print(f"DEBUG NAV: Waypoint reached. Switching to next waypoint index {path_index} at logical relative {waypoint} (dist: {wp_dist:.2f} px, sharp_turn: {is_sharp_turn}, passed: {has_passed_waypoint})")
 
                             # --- Алгоритм "Виртуальная Морковка" (Pure Pursuit) ---
-                            # Дистанция взгляда вперед (в логических пикселях). Чем больше, тем плавнее повороты.
-                            lookahead = 4.0 
+                            # Динамическая дистанция взгляда вперед (в логических пикселях).
+                            if is_sharp_turn:
+                                # На крутых поворотах сжимаем морковку по мере приближения к углу (от 4.0 до min_lookahead)
+                                lookahead = max(self.lookahead_turn_min, min(4.0, wp_dist))
+                            else:
+                                # На прямых участках держим морковку дальше для плавности
+                                lookahead = self.lookahead_straight
                             
                             carrot_x = waypoint[0]
                             carrot_y = waypoint[1]
@@ -483,15 +562,10 @@ class TestMoveThread(QThread):
 
                             angle = math.atan2(dy, dx)
 
-                            # Тянем джойстик на полную мощность без замедления, как запросил пользователь
+                            # Тянем джойстик на полную мощность, так как в игре нет регулируемой скорости (только 0% или 100%)
                             if not self.passive_mode:
                                 phys_radius = self.joy_settings['radius'] * self.scale
                                 
-                                # Плавное замедление при приближении к финальной цели (чтобы не пролетать мимо и не крутиться)
-                                if final_dist < 8.0:
-                                    speed_factor = max(0.25, final_dist / 8.0)
-                                    phys_radius = phys_radius * speed_factor
-
                                 drag_x_phys = phys_joy_x + math.cos(angle) * phys_radius
                                 drag_y_phys = phys_joy_y + math.sin(angle) * phys_radius
 
@@ -1720,99 +1794,198 @@ class SettingsPage(QWidget):
         move_page = QWidget()
         move_layout = QVBoxLayout(move_page)
         move_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        move_layout.setContentsMargins(15, 15, 15, 15)
+        move_layout.setContentsMargins(15, 8, 15, 8)
         
         move_title = QLabel("Настройки навигации и движения")
-        move_title.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 10px;")
+        move_title.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 5px;")
         move_layout.addWidget(move_title)
         
         # Сетка для настроек
         move_grid = QGridLayout()
-        move_grid.setSpacing(15)
+        move_grid.setVerticalSpacing(6)
+        move_grid.setHorizontalSpacing(10)
+        move_grid.setColumnStretch(0, 0)
+        move_grid.setColumnStretch(1, 1)
         
+        def add_setting_row(label_text, spinbox, tooltip_text, row):
+            label = QLabel(label_text)
+            label.setStyleSheet("font-size: 14px;")
+            
+            spinbox.setFixedWidth(80)
+            
+            help_btn = QPushButton("?")
+            help_btn.setFixedSize(28, 28)
+            help_btn.setToolTip(tooltip_text)
+            help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            help_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #313244;
+                    color: #cdd6f4;
+                    border: 1px solid #45475a;
+                    border-radius: 4px;
+                    font-weight: bold;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #45475a;
+                    color: #f9e2af;
+                }
+            """)
+            help_btn.clicked.connect(lambda: self.show_help_dialog(label_text, tooltip_text))
+            
+            # Контейнер для поля ввода и знака вопроса, прижатый влево
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            row_layout.addWidget(spinbox)
+            row_layout.addWidget(help_btn)
+            row_layout.addStretch()
+            
+            move_grid.addWidget(label, row, 0)
+            move_grid.addWidget(row_widget, row, 1)
+            
         # Интервал сканирования
-        scan_label = QLabel("Интервал сканирования миникарты (мс):")
-        scan_label.setStyleSheet("font-size: 14px;")
         self.scan_interval_spin = QSpinBox()
         self.scan_interval_spin.setRange(20, 1000)
         self.scan_interval_spin.setValue(self.settings_obj.value("nav_scan_interval", 100, type=int))
         self.scan_interval_spin.setSingleStep(10)
-        self.scan_interval_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244;")
+        self.scan_interval_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.scan_interval_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_scan_interval", v))
+        add_setting_row(
+            "Интервал сканирования миникарты (мс):", 
+            self.scan_interval_spin, 
+            "Частота анализа скриншота миникарты. Меньше значение — быстрее реакция бота, но выше нагрузка на процессор. Рекомендуется 100 мс.",
+            0
+        )
         
         # Погрешность цели
-        target_tol_label = QLabel("Погрешность прибытия в точку (px):")
-        target_tol_label.setStyleSheet("font-size: 14px;")
         self.target_tolerance_spin = QSpinBox()
         self.target_tolerance_spin.setRange(0, 100)
         self.target_tolerance_spin.setValue(self.settings_obj.value("nav_target_tolerance", 10, type=int))
-        self.target_tolerance_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.target_tolerance_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.target_tolerance_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_target_tolerance", v))
+        add_setting_row(
+            "Погрешность прибытия в точку (px):",
+            self.target_tolerance_spin,
+            "Радиус зоны вокруг конечной цели на миникарте, при достижении которой движение считается завершенным.",
+            1
+        )
         
         # Порог переключения по прямой
-        wp_straight_label = QLabel("Порог переключения по прямой (px):")
-        wp_straight_label.setStyleSheet("font-size: 14px;")
         self.wp_straight_spin = QDoubleSpinBox()
         self.wp_straight_spin.setRange(0.0, 20.0)
         self.wp_straight_spin.setSingleStep(0.5)
         self.wp_straight_spin.setDecimals(1)
         self.wp_straight_spin.setValue(float(self.settings_obj.value("nav_wp_straight", 4.0)))
-        self.wp_straight_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.wp_straight_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.wp_straight_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_wp_straight", v))
+        add_setting_row(
+            "Порог переключения по прямой (px):",
+            self.wp_straight_spin,
+            "Расстояние до следующего вейпоинта на прямых участках, при достижении которого бот начинает целиться на следующий ориентир.",
+            2
+        )
         
         # Порог переключения на поворотах
-        wp_turn_label = QLabel("Порог переключения на поворотах (px):")
-        wp_turn_label.setStyleSheet("font-size: 14px;")
         self.wp_turn_spin = QDoubleSpinBox()
         self.wp_turn_spin.setRange(0.0, 20.0)
         self.wp_turn_spin.setSingleStep(0.5)
         self.wp_turn_spin.setDecimals(1)
         self.wp_turn_spin.setValue(float(self.settings_obj.value("nav_wp_turn", 1.8)))
-        self.wp_turn_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.wp_turn_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.wp_turn_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_wp_turn", v))
+        add_setting_row(
+            "Порог переключения на поворотах (px):",
+            self.wp_turn_spin,
+            "Расстояние до вейпоинта на крутом повороте. Бот должен подойти ближе к углу перед тем, как переключиться на следующий шаг.",
+            3
+        )
         
-        early_stop_label = QLabel("Тормозной путь (ранняя остановка, px):")
-        early_stop_label.setStyleSheet("font-size: 14px;")
+        # Тормозной путь
         self.early_stop_spin = QDoubleSpinBox()
         self.early_stop_spin.setRange(0.0, 20.0)
         self.early_stop_spin.setSingleStep(0.5)
         self.early_stop_spin.setDecimals(1)
         self.early_stop_spin.setValue(float(self.settings_obj.value("nav_early_stop", 0.0)))
-        self.early_stop_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.early_stop_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.early_stop_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_early_stop", v))
+        add_setting_row(
+            "Тормозной путь (ранняя остановка, px):",
+            self.early_stop_spin,
+            "Дистанция до финальной цели, на которой бот полностью отпустит джойстик, позволяя персонажу докатиться по инерции.",
+            4
+        )
+        
+        # Дистанция взгляда по прямой
+        self.lookahead_straight_spin = QDoubleSpinBox()
+        self.lookahead_straight_spin.setRange(1.0, 50.0)
+        self.lookahead_straight_spin.setSingleStep(0.5)
+        self.lookahead_straight_spin.setDecimals(1)
+        self.lookahead_straight_spin.setValue(float(self.settings_obj.value("nav_lookahead_straight", 5.5)))
+        self.lookahead_straight_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.lookahead_straight_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_lookahead_straight", v))
+        add_setting_row(
+            "Дистанция взгляда по прямой (px):",
+            self.lookahead_straight_spin,
+            "Расстояние упреждения пути (lookahead) на прямых отрезках. Задает упреждающую цель движения по траектории.",
+            5
+        )
+
+        # Мин. дистанция взгляда на повороте
+        self.lookahead_turn_min_spin = QDoubleSpinBox()
+        self.lookahead_turn_min_spin.setRange(0.5, 20.0)
+        self.lookahead_turn_min_spin.setSingleStep(0.1)
+        self.lookahead_turn_min_spin.setDecimals(1)
+        self.lookahead_turn_min_spin.setValue(float(self.settings_obj.value("nav_lookahead_turn_min", 1.5)))
+        self.lookahead_turn_min_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.lookahead_turn_min_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_lookahead_turn_min", v))
+        add_setting_row(
+            "Мин. дистанция взгляда на повороте (px):",
+            self.lookahead_turn_min_spin,
+            "Минимальное расстояние упреждения (lookahead) перед крутыми поворотами. Помогает точнее вписываться в углы.",
+            6
+        )
+
+        # Пауза Stop-and-Turn
+        self.stop_turn_pause_spin = QSpinBox()
+        self.stop_turn_pause_spin.setRange(0, 2000)
+        self.stop_turn_pause_spin.setSingleStep(50)
+        self.stop_turn_pause_spin.setValue(int(self.settings_obj.value("nav_stop_turn_pause", 150)))
+        self.stop_turn_pause_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.stop_turn_pause_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("nav_stop_turn_pause", v))
+        add_setting_row(
+            "Пауза Stop-and-Turn (мс):",
+            self.stop_turn_pause_spin,
+            "Временная микропауза при прохождении крутых углов для полной остановки персонажа и устранения инерционного заноса.",
+            7
+        )
         
         # Смещение точек по X на карте
-        map_shift_x_label = QLabel("Смещение точек по X на карте (px):")
-        map_shift_x_label.setStyleSheet("font-size: 14px;")
         self.map_shift_x_spin = QSpinBox()
         self.map_shift_x_spin.setRange(-100, 100)
         self.map_shift_x_spin.setValue(self.settings_obj.value("map_draw_shift_x", 10, type=int))
-        self.map_shift_x_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.map_shift_x_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.map_shift_x_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("map_draw_shift_x", v))
+        add_setting_row(
+            "Смещение точек по X на карте (px):",
+            self.map_shift_x_spin,
+            "Смещение отрисовки траектории по горизонтали относительно миникарты для точного центрирования.",
+            8
+        )
         
         # Смещение точек по Y на карте
-        map_shift_y_label = QLabel("Смещение точек по Y на карте (px):")
-        map_shift_y_label.setStyleSheet("font-size: 14px;")
         self.map_shift_y_spin = QSpinBox()
         self.map_shift_y_spin.setRange(-100, 100)
         self.map_shift_y_spin.setValue(self.settings_obj.value("map_draw_shift_y", 0, type=int))
-        self.map_shift_y_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
+        self.map_shift_y_spin.setStyleSheet("padding: 4px; background-color: #181825; border: 1px solid #313244; color: #cdd6f4;")
         self.map_shift_y_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("map_draw_shift_y", v))
-        
-        move_grid.addWidget(scan_label, 0, 0)
-        move_grid.addWidget(self.scan_interval_spin, 0, 1)
-        move_grid.addWidget(target_tol_label, 1, 0)
-        move_grid.addWidget(self.target_tolerance_spin, 1, 1)
-        move_grid.addWidget(wp_straight_label, 2, 0)
-        move_grid.addWidget(self.wp_straight_spin, 2, 1)
-        move_grid.addWidget(wp_turn_label, 3, 0)
-        move_grid.addWidget(self.wp_turn_spin, 3, 1)
-        move_grid.addWidget(early_stop_label, 4, 0)
-        move_grid.addWidget(self.early_stop_spin, 4, 1)
-        move_grid.addWidget(map_shift_x_label, 5, 0)
-        move_grid.addWidget(self.map_shift_x_spin, 5, 1)
-        move_grid.addWidget(map_shift_y_label, 6, 0)
-        move_grid.addWidget(self.map_shift_y_spin, 6, 1)
+        add_setting_row(
+            "Смещение точек по Y на карте (px):",
+            self.map_shift_y_spin,
+            "Смещение отрисовки траектории по вертикали относительно миникарты для точного центрирования.",
+            9
+        )
         
         move_layout.addLayout(move_grid)
         move_layout.addStretch()
@@ -1821,6 +1994,10 @@ class SettingsPage(QWidget):
 
         # По умолчанию выбираем первую категорию
         self.category_list.setCurrentRow(0)
+
+    def show_help_dialog(self, title, text):
+        popup = HelpPopup(self, title, text)
+        popup.exec()
 
     def on_coords_tab_changed(self, tab_id):
         tab_keys = ["buttons", "bosses", "chests", "gifts"]
@@ -3050,13 +3227,19 @@ class SettingsPage(QWidget):
         wp_straight = self.wp_straight_spin.value()
         wp_turn = self.wp_turn_spin.value()
         early_stop = self.early_stop_spin.value()
+        lookahead_straight = self.lookahead_straight_spin.value()
+        lookahead_turn_min = self.lookahead_turn_min_spin.value()
+        stop_turn_pause = self.stop_turn_pause_spin.value()
         
         self.move_thread = TestMoveThread(
             target_pos, joy_settings, region, scale, marker_path, threshold,
             self.cb_enable_centering.isChecked(),
             (self.interactive_map.original_x, self.interactive_map.original_y),
             scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn, early_stop,
-            self.cb_save_debug_map.isChecked()
+            self.cb_save_debug_map.isChecked(),
+            lookahead_straight=lookahead_straight,
+            lookahead_turn_min=lookahead_turn_min,
+            stop_turn_pause=stop_turn_pause
         )
         
         def on_move_finished():
@@ -3125,6 +3308,9 @@ class SettingsPage(QWidget):
         wp_straight = self.wp_straight_spin.value()
         wp_turn = self.wp_turn_spin.value()
         early_stop = self.early_stop_spin.value()
+        lookahead_straight = self.lookahead_straight_spin.value()
+        lookahead_turn_min = self.lookahead_turn_min_spin.value()
+        stop_turn_pause = self.stop_turn_pause_spin.value()
         
         self.move_thread = TestMoveThread(
             target_pos, joy_settings, region, scale, marker_path, threshold,
@@ -3132,7 +3318,10 @@ class SettingsPage(QWidget):
             (self.interactive_map.original_x, self.interactive_map.original_y),
             scan_interval, target_tolerance, map_path, wall_offset, wp_straight, wp_turn, early_stop,
             save_debug_map=True,
-            passive_mode=True
+            passive_mode=True,
+            lookahead_straight=lookahead_straight,
+            lookahead_turn_min=lookahead_turn_min,
+            stop_turn_pause=stop_turn_pause
         )
         
         def on_move_finished():

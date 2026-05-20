@@ -205,3 +205,13 @@ QInputDialog QLineEdit {
     border: 1px solid #aaa;
     padding: 4px;
 }
+
+/* QToolTip - Всплывающие подсказки */
+QToolTip {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    border: 1px solid #cba6f7;
+    border-radius: 4px;
+    padding: 6px;
+    font-size: 13px;
+}
