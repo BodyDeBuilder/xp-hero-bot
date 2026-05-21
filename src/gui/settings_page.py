@@ -3,10 +3,10 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QPushButton, QStackedWidget, QLabel, QCheckBox,
     QLineEdit, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QInputDialog, QMessageBox, QSlider, QComboBox, QColorDialog, QDialog,
-    QApplication, QButtonGroup, QMenu, QGridLayout
+    QApplication, QButtonGroup, QMenu, QGridLayout, QAbstractItemView, QStyledItemDelegate
 )
-from PyQt6.QtCore import Qt, QSettings, pyqtSignal, QTimer, QPoint, QRect, QThread
-from PyQt6.QtGui import QPainter, QPen, QPixmap, QColor, QBrush, QImage, QAction, QKeySequence
+from PyQt6.QtCore import Qt, QSettings, pyqtSignal, QTimer, QPoint, QRect, QThread, QVariantAnimation, QEasingCurve
+from PyQt6.QtGui import QPainter, QPen, QPixmap, QColor, QBrush, QImage, QAction, QKeySequence, QIntValidator
 import os
 import shutil
 import json
@@ -214,7 +214,325 @@ class FilterHeader(QHeaderView):
         elif action == filter_clear:
             self.filter_requested.emit(index, "clear", None)
 
+class CellWrapper(QWidget):
+    def __init__(self, widget):
+        super().__init__()
+        self.inner_widget = widget
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignBottom)
+        layout.addWidget(widget)
+
+def get_inner_widget(widget):
+    if isinstance(widget, CellWrapper):
+        return widget.inner_widget
+    return widget
+
+class TransparentTextDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.text = ""
+
+class CoordCellWidget(QWidget):
+    def __init__(self, x, y, on_changed_callback, parent=None):
+        super().__init__(parent)
+        self.on_changed_callback = on_changed_callback
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 0, 5, 0)
+        layout.setSpacing(2)
+        layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        
+        self.lbl_x = QLabel("X:")
+        self.lbl_x.setStyleSheet("color: #a6adc8; font-size: 14px;")
+        
+        self.edit_x = QLineEdit(str(x))
+        self.edit_x.setFixedWidth(50)
+        self.edit_x.setStyleSheet("""
+            QLineEdit {
+                background: transparent;
+                border: none;
+                color: #cdd6f4;
+                font-size: 14px;
+                padding: 0px;
+            }
+            QLineEdit:focus {
+                background-color: #313244;
+                border-radius: 2px;
+                color: #f5c2e7;
+            }
+        """)
+        self.edit_x.setValidator(QIntValidator(0, 99999))
+        self.edit_x.editingFinished.connect(self.on_editing_finished)
+        
+        self.lbl_y = QLabel(" Y:")
+        self.lbl_y.setStyleSheet("color: #a6adc8; font-size: 14px;")
+        
+        self.edit_y = QLineEdit(str(y))
+        self.edit_y.setFixedWidth(50)
+        self.edit_y.setStyleSheet("""
+            QLineEdit {
+                background: transparent;
+                border: none;
+                color: #cdd6f4;
+                font-size: 14px;
+                padding: 0px;
+            }
+            QLineEdit:focus {
+                background-color: #313244;
+                border-radius: 2px;
+                color: #f5c2e7;
+            }
+        """)
+        self.edit_y.setValidator(QIntValidator(0, 99999))
+        self.edit_y.editingFinished.connect(self.on_editing_finished)
+        
+        layout.addWidget(self.lbl_x)
+        layout.addWidget(self.edit_x)
+        layout.addWidget(self.lbl_y)
+        layout.addWidget(self.edit_y)
+        
+        self._last_x = str(x)
+        self._last_y = str(y)
+
+    def get_values(self):
+        try:
+            x = int(self.edit_x.text()) if self.edit_x.text() else 0
+        except ValueError:
+            x = 0
+        try:
+            y = int(self.edit_y.text()) if self.edit_y.text() else 0
+        except ValueError:
+            y = 0
+        return x, y
+
+    def set_values(self, x, y):
+        self.edit_x.setText(str(x))
+        self.edit_y.setText(str(y))
+        self._last_x = str(x)
+        self._last_y = str(y)
+
+    def on_editing_finished(self):
+        curr_x = self.edit_x.text()
+        curr_y = self.edit_y.text()
+        if curr_x != self._last_x or curr_y != self._last_y:
+            self._last_x = curr_x
+            self._last_y = curr_y
+            self.on_changed_callback()
+
+    def mouseDoubleClickEvent(self, event):
+        x_val, y_val = self.get_values()
+        text_to_copy = f"X: {x_val}, Y: {y_val}"
+        QApplication.clipboard().setText(text_to_copy)
+        
+        table = self.parent_widget_of_type(QTableWidget)
+        if table:
+            pos = self.mapTo(table, event.position().toPoint())
+            index = table.indexAt(pos)
+            if index.isValid():
+                table.setCurrentCell(index.row(), index.column())
+                
+        super().mouseDoubleClickEvent(event)
+
+    def parent_widget_of_type(self, widget_type):
+        p = self.parent()
+        while p:
+            if isinstance(p, widget_type):
+                return p
+            p = p.parent()
+        return None
+
 class CoordTableWidget(QTableWidget):
+    def __init__(self, rows, columns, parent_page=None):
+        super().__init__(rows, columns)
+        self.parent_page = parent_page
+        self.current_drop_row = None
+        self.dragged_source_row = None
+        self.animate_entry_row = None
+        self.animating_rows = {}
+        
+        # Настройка Drag and Drop для перемещения строк
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropOverwriteMode(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+    def startDrag(self, supportedActions):
+        self.dragged_source_row = self.currentRow()
+        
+        # Запускаем анимацию сжатия строки источника через 50мс,
+        # чтобы Qt успел сделать качественный снимок строки для курсора
+        QTimer.singleShot(50, self.shrink_source_row)
+        
+        super().startDrag(supportedActions)
+        self.reset_all_row_heights()
+
+    def shrink_source_row(self):
+        if hasattr(self, 'dragged_source_row') and self.dragged_source_row is not None:
+            if 0 <= self.dragged_source_row < self.rowCount():
+                self.animate_row_height(self.dragged_source_row, 0)
+
+    def animate_row_height(self, row, target_height):
+        if row < 0 or row >= self.rowCount():
+            return
+            
+        current_anim = self.animating_rows.get(row)
+        if current_anim:
+            if current_anim.endValue() == target_height:
+                return
+            current_anim.stop()
+            
+        start_height = self.rowHeight(row)
+        anim = QVariantAnimation(self)
+        anim.setStartValue(start_height)
+        anim.setEndValue(target_height)
+        anim.setDuration(120)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        
+        def update_height(val):
+            if row < self.rowCount():
+                self.setRowHeight(row, val)
+                
+        anim.valueChanged.connect(update_height)
+        anim.finished.connect(lambda: self.animating_rows.pop(row, None))
+        
+        self.animating_rows[row] = anim
+        anim.start()
+
+    def reset_all_row_heights(self):
+        for anim in list(self.animating_rows.values()):
+            anim.stop()
+        self.animating_rows.clear()
+        
+        default_h = self.verticalHeader().defaultSectionSize()
+        for r in range(self.rowCount()):
+            self.setRowHeight(r, default_h)
+        self.current_drop_row = None
+        self.viewport().update()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+            event.acceptProposedAction()
+            self.current_drop_row = None
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+            event.acceptProposedAction()
+            
+            pos = event.position().toPoint()
+            index = self.indexAt(pos)
+            row = index.row()
+            
+            default_h = self.verticalHeader().defaultSectionSize()
+            
+            # Находим целевую строку для сброса
+            if row >= 0:
+                rect = self.visualRect(index)
+                if pos.y() < rect.y() + rect.height() / 2:
+                    drop_row = row
+                else:
+                    drop_row = row + 1
+            else:
+                total_height = 0
+                for r in range(self.rowCount()):
+                    total_height += self.rowHeight(r)
+                if pos.y() >= total_height:
+                    drop_row = self.rowCount()
+                else:
+                    drop_row = 0
+                    
+            if drop_row != self.current_drop_row:
+                old_drop_row = self.current_drop_row
+                self.current_drop_row = drop_row
+                
+                # Сворачиваем старую раздвинутую строку
+                if old_drop_row is not None and old_drop_row < self.rowCount():
+                    self.animate_row_height(old_drop_row, default_h)
+                    
+                # Раздвигаем новую строку (создаем свободное пространство для визуального эффекта)
+                if drop_row < self.rowCount():
+                    self.animate_row_height(drop_row, default_h + 24)
+                
+                self.viewport().update()
+        else:
+            super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):
+        self.reset_all_row_heights()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        source_row = self.currentRow()
+        dest_row = self.current_drop_row
+        
+        self.reset_all_row_heights()
+        
+        if source_row >= 0 and dest_row is not None:
+            # Корректируем dest_row с учетом pop()
+            if dest_row > source_row:
+                dest_row -= 1
+                
+            if 0 <= dest_row < self.rowCount() and source_row != dest_row:
+                if hasattr(self, "parent_page") and self.parent_page:
+                    # Вызываем асинхронно с задержкой 0 мс, чтобы дать Qt завершить сессию перетаскивания,
+                    # предотвращая скрытие / пропажу строки из таблицы
+                    QTimer.singleShot(0, lambda s=source_row, d=dest_row: self.parent_page.move_coord_row(s, d))
+                    
+        event.setDropAction(Qt.DropAction.IgnoreAction)
+        event.accept()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        
+        if self.current_drop_row is not None and 0 <= self.current_drop_row <= self.rowCount():
+            painter = QPainter(self.viewport())
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            default_h = self.verticalHeader().defaultSectionSize()
+            
+            # Вычисляем координату Y для линии вставки
+            if self.current_drop_row == self.rowCount():
+                y = 0
+                for r in range(self.rowCount()):
+                    y += self.rowHeight(r)
+            else:
+                y = 0
+                for r in range(self.current_drop_row):
+                    y += self.rowHeight(r)
+                    
+            gap = 0
+            if self.current_drop_row < self.rowCount():
+                current_height = self.rowHeight(self.current_drop_row)
+                if current_height > default_h:
+                    gap = (current_height - default_h) // 2
+                    
+            line_y = y + gap
+            
+            # Рисуем красивую неоновую линию (фиолетовый цвет Catppuccin Lavender)
+            glow_color = QColor("#cba6f7")
+            
+            # Внешнее неоновое свечение
+            pen_glow = QPen(QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 70), 6)
+            painter.setPen(pen_glow)
+            painter.drawLine(10, line_y, self.width() - 10, line_y)
+            
+            # Центральная линия
+            pen_line = QPen(QColor("#b4befe"), 2)
+            painter.setPen(pen_line)
+            painter.drawLine(10, line_y, self.width() - 10, line_y)
+            
+            # Стилизованные крайние точки
+            painter.setBrush(QBrush(QColor("#b4befe")))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPoint(10, line_y), 5, 5)
+            painter.drawEllipse(QPoint(self.width() - 10, line_y), 5, 5)
+
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.StandardKey.Copy):
             self.copy_selection()
@@ -241,10 +559,12 @@ class CoordTableWidget(QTableWidget):
             nums = re.findall(r'\d+', text)
             if len(nums) >= 2:
                 item.setText(f"X: {nums[0]}, Y: {nums[1]}")
+                wrapper = self.cellWidget(item.row(), 1)
+                coord_widget = get_inner_widget(wrapper)
+                if isinstance(coord_widget, CoordCellWidget):
+                    coord_widget.set_values(int(nums[0]), int(nums[1]))
         elif item.column() == 0: # Колонка названия
             item.setText(text)
-        
-        # Сигнал itemChanged вызовется автоматически при setText
 
 class TestMoveThread(QThread):
     finished = Signal()
@@ -367,8 +687,8 @@ class TestMoveThread(QThread):
                         raw_rel_x = max_loc[0] / self.scale + (marker_w / self.scale) / 2
                         raw_rel_y = max_loc[1] / self.scale + (marker_h / self.scale) / 2
                         if self.centering_enabled:
-                            raw_rel_x = max_loc[0] / self.scale + self.centering_offset[0]
-                            raw_rel_y = max_loc[1] / self.scale + self.centering_offset[1]
+                            raw_rel_x = max_loc[0] / self.scale + self.centering_offset[0] / self.scale
+                            raw_rel_y = max_loc[1] / self.scale + self.centering_offset[1] / self.scale
                         
                         raw_final_dist = math.sqrt((raw_target_rel_x - raw_rel_x)**2 + (raw_target_rel_y - raw_rel_y)**2) if self.target_pos else 999.0
 
@@ -722,8 +1042,8 @@ class AutoDetector(QThread):
                             
                             if self.centering_enabled:
                                 # Добавляем смещение центра относительно левого верхнего угла (в логических пикселях, соответствующих MapRecorder)
-                                final_x = int(found_x + self.centering_offset[0])
-                                final_y = int(found_y + self.centering_offset[1])
+                                final_x = int(found_x + self.centering_offset[0] / scale)
+                                final_y = int(found_y + self.centering_offset[1] / scale)
                             else:
                                 # Если центрирование выключено, используем центр самого маркера
                                 marker_h, marker_w = template.shape[:2]
@@ -934,6 +1254,7 @@ class SettingsPage(QWidget):
         self.current_coords_tab = "buttons" # По умолчанию
         self.map_recorder = MapRecorder(self.settings_obj)
         self.map_recorder.preview_updated.connect(self.on_map_preview_updated)
+        self.map_recorder.preview_image_updated.connect(self.on_map_preview_image_updated)
         
         # Инициализируем глобальный поток отслеживания хоткея экстренной остановки
         self.hotkey_thread = GlobalHotkeyThread(self)
@@ -1462,7 +1783,8 @@ class SettingsPage(QWidget):
         coords_layout.addLayout(header_layout)
 
         # Создаем таблицу
-        self.coords_table = CoordTableWidget(0, 6)
+        self.coords_table = CoordTableWidget(0, 6, self)
+        self.coords_table.setItemDelegateForColumn(1, TransparentTextDelegate(self.coords_table))
         
         # Устанавливаем кастомный заголовок с фильтрами
         self.filter_header = FilterHeader(self.coords_table)
@@ -1570,9 +1892,9 @@ class SettingsPage(QWidget):
         
         interval_label = QLabel("Интервал (мс):")
         self.rec_interval_spin = QSpinBox()
-        self.rec_interval_spin.setRange(50, 5000)
+        self.rec_interval_spin.setRange(10, 5000)
         self.rec_interval_spin.setValue(self.settings_obj.value("rec_interval_ms", 500, type=int))
-        self.rec_interval_spin.setSingleStep(50)
+        self.rec_interval_spin.setSingleStep(10)
         self.rec_interval_spin.setStyleSheet("padding: 5px; background-color: #181825; border: 1px solid #313244;")
         self.rec_interval_spin.valueChanged.connect(lambda v: self.settings_obj.setValue("rec_interval_ms", v))
 
@@ -2284,7 +2606,9 @@ class SettingsPage(QWidget):
             self.coords_table.setSortingEnabled(True)
             self.coords_table.sortByColumn(index, value)
             self.coords_table.setSortingEnabled(False)
-            # После сортировки нужно обновить индексы строк в лямбда-функциях кнопок
+            # После сортировки сохраняем упорядоченный список
+            self.save_coords()
+            # Обновляем индексы строк в лямбда-функциях кнопок
             self.refresh_row_buttons()
         elif action == "filter_contains":
             for row in range(self.coords_table.rowCount()):
@@ -2294,7 +2618,7 @@ class SettingsPage(QWidget):
                 if item:
                     text = item.text().lower()
                 else:
-                    widget = self.coords_table.cellWidget(row, index)
+                    widget = get_inner_widget(self.coords_table.cellWidget(row, index))
                     if isinstance(widget, QSpinBox):
                         text = str(widget.value())
                 
@@ -2309,7 +2633,7 @@ class SettingsPage(QWidget):
                 if item:
                     text = item.text().lower()
                 else:
-                    widget = self.coords_table.cellWidget(row, index)
+                    widget = get_inner_widget(self.coords_table.cellWidget(row, index))
                     if isinstance(widget, QSpinBox):
                         text = str(widget.value())
                 
@@ -2497,7 +2821,9 @@ class SettingsPage(QWidget):
         for row in range(self.coords_table.rowCount()):
             name_item = self.coords_table.item(row, 0)
             coord_item = self.coords_table.item(row, 1)
-            spinbox = self.coords_table.cellWidget(row, 2)
+            wrapper = self.coords_table.cellWidget(row, 1)
+            coord_widget = get_inner_widget(wrapper)
+            spinbox = get_inner_widget(self.coords_table.cellWidget(row, 2))
             
             # Если еще не все элементы созданы в UI (во время insert_row_ui)
             if not name_item or not coord_item or not spinbox:
@@ -2513,11 +2839,16 @@ class SettingsPage(QWidget):
                 # Обновляем сохраненное старое имя, чтобы не переименовывать повторно
                 name_item.setData(Qt.ItemDataRole.UserRole, new_name)
             
-            # Парсим координаты из текста ячейки (на случай Ctrl+V)
-            coord_text = coord_item.text()
-            nums = re.findall(r'\d+', coord_text)
-            x = int(nums[0]) if len(nums) >= 1 else 0
-            y = int(nums[1]) if len(nums) >= 2 else 0
+            if isinstance(coord_widget, CoordCellWidget):
+                x, y = coord_widget.get_values()
+                self.coords_table.blockSignals(True)
+                coord_item.setText(f"X: {x}, Y: {y}")
+                self.coords_table.blockSignals(False)
+            else:
+                coord_text = coord_item.text()
+                nums = re.findall(r'\d+', coord_text)
+                x = int(nums[0]) if len(nums) >= 1 else 0
+                y = int(nums[1]) if len(nums) >= 2 else 0
             
             target = {
                 "name": new_name,
@@ -2534,6 +2865,30 @@ class SettingsPage(QWidget):
         # Обновляем тестовый оверлей, если он включен
         if self.test_overlay and self.test_overlay.isVisible():
             self.test_overlay.update_targets(self.coords_list)
+
+    def move_coord_row(self, source_row, dest_row):
+        if source_row == dest_row:
+            return
+            
+        self.save_to_history()
+        
+        # Переставляем элементы в coords_list
+        item = self.coords_list.pop(source_row)
+        self.coords_list.insert(dest_row, item)
+        
+        # Сохраняем новый порядок в QSettings
+        key = f"coords_list_{self.current_coords_tab}"
+        self.settings_obj.setValue(key, json.dumps(self.coords_list))
+        
+        # Устанавливаем индекс строки для анимации входа
+        self.coords_table.animate_entry_row = dest_row
+        
+        # Перезагружаем UI
+        self.load_coords()
+        
+        # Выделяем перенесенную строку
+        self.coords_table.setCurrentCell(dest_row, 0)
+        self.coords_table.selectRow(dest_row)
 
     def add_coord_row(self):
         self.save_to_history()
@@ -2600,13 +2955,21 @@ class SettingsPage(QWidget):
                     self.coords_list[row]["x"] = pos[0]
                     self.coords_list[row]["y"] = pos[1]
                     
+                    # Обновляем виджет координат
+                    wrapper = self.coords_table.cellWidget(row, 1)
+                    coord_widget = get_inner_widget(wrapper)
+                    if isinstance(coord_widget, CoordCellWidget):
+                        coord_widget.set_values(pos[0], pos[1])
+                    
                     # Сохраняем все координаты
                     self.save_coords()
                     
                     # Обновляем текст в ячейке таблицы (2 колонка)
                     coord_item = self.coords_table.item(row, 1)
                     if coord_item:
+                        self.coords_table.blockSignals(True)
                         coord_item.setText(f"X: {pos[0]}, Y: {pos[1]}")
+                        self.coords_table.blockSignals(False)
                 
                 if self.test_overlay and self.test_overlay.isVisible():
                     self.test_overlay.update_targets(self.coords_list)
@@ -2635,15 +2998,35 @@ class SettingsPage(QWidget):
         self.coords_table.blockSignals(True)
         self.coords_table.insertRow(row)
         
+        # Гарантируем сброс скрытого состояния и высоты для предотвращения багов с пропаданием строк
+        self.coords_table.setRowHidden(row, False)
+        
+        default_h = self.coords_table.verticalHeader().defaultSectionSize()
+        should_animate = (hasattr(self.coords_table, "animate_entry_row") and 
+                          self.coords_table.animate_entry_row == row)
+                          
+        if should_animate:
+            self.coords_table.setRowHeight(row, 0)
+            self.coords_table.animate_row_height(row, default_h)
+            self.coords_table.animate_entry_row = None
+        else:
+            self.coords_table.setRowHeight(row, default_h)
+        
         # 1 колонка: Название
         name_item = QTableWidgetItem(target.get("name", ""))
         name_item.setData(Qt.ItemDataRole.UserRole, target.get("name", ""))
+        name_item.setTextAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+        name_item.setFlags(name_item.flags() | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
         self.coords_table.setItem(row, 0, name_item)
         
-        # 2 колонка: Координаты
+        # 2 колонка: Координаты (подлежащий QTableWidgetItem + красивый встроенный виджет CoordCellWidget)
         coord_cell = QTableWidgetItem(f"X: {target.get('x', 0)}, Y: {target.get('y', 0)}")
-        coord_cell.setFlags(coord_cell.flags() & ~Qt.ItemFlag.ItemIsEditable) # Только чтение
+        coord_cell.setFlags((coord_cell.flags() & ~Qt.ItemFlag.ItemIsEditable) | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+        coord_cell.setTextAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
         self.coords_table.setItem(row, 1, coord_cell)
+        
+        coord_widget = CoordCellWidget(target.get('x', 0), target.get('y', 0), self.save_coords, self.coords_table)
+        self.coords_table.setCellWidget(row, 1, CellWrapper(coord_widget))
         
         # 3 колонка: Погрешность (QSpinBox)
         spinbox = QSpinBox()
@@ -2651,14 +3034,14 @@ class SettingsPage(QWidget):
         spinbox.setValue(target.get("tolerance", 10))
         spinbox.setStyleSheet("color: #cdd6f4; background-color: #313244; border: none; padding: 2px;")
         spinbox.valueChanged.connect(self.on_tolerance_changed)
-        self.coords_table.setCellWidget(row, 2, spinbox)
+        self.coords_table.setCellWidget(row, 2, CellWrapper(spinbox))
 
         # 4 колонка: Скрин
         btn_snap = QPushButton("🖼")
         btn_snap.setStyleSheet("background-color: #94e2d5; color: #11111b; font-weight: bold; border-radius: 4px; padding: 5px; font-size: 16px;")
         btn_snap.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_snap.clicked.connect(lambda _, r=row: self.show_screenshot(r))
-        self.coords_table.setCellWidget(row, 3, btn_snap)
+        self.coords_table.setCellWidget(row, 3, CellWrapper(btn_snap))
         
         # 5 колонка: Действие (Опред и Опред+)
         btns_container = QWidget()
@@ -2678,28 +3061,28 @@ class SettingsPage(QWidget):
         
         btns_layout.addWidget(btn_manual)
         btns_layout.addWidget(btn_auto)
-        self.coords_table.setCellWidget(row, 4, btns_container)
+        self.coords_table.setCellWidget(row, 4, CellWrapper(btns_container))
 
         # 6 колонка: Удалить
         del_btn = QPushButton("🗑")
         del_btn.setStyleSheet("background-color: #f38ba8; color: #11111b; border-radius: 4px; padding: 5px; font-weight: bold; margin: 2px; font-size: 16px;")
         del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         del_btn.clicked.connect(lambda _, r=row: self.delete_coord_row(r))
-        self.coords_table.setCellWidget(row, 5, del_btn)
+        self.coords_table.setCellWidget(row, 5, CellWrapper(del_btn))
         
         self.coords_table.blockSignals(False)
 
     def refresh_row_buttons(self):
         for row in range(self.coords_table.rowCount()):
             # Обновляем кнопку Скрин
-            btn_snap = self.coords_table.cellWidget(row, 3)
+            btn_snap = get_inner_widget(self.coords_table.cellWidget(row, 3))
             if btn_snap:
                 try: btn_snap.clicked.disconnect()
                 except: pass
                 btn_snap.clicked.connect(lambda _, r=row: self.show_screenshot(r))
 
             # Обновляем кнопки в контейнере (Опред и Опред+)
-            container = self.coords_table.cellWidget(row, 4)
+            container = get_inner_widget(self.coords_table.cellWidget(row, 4))
             if container:
                 layout = container.layout()
                 if layout:
@@ -2715,7 +3098,7 @@ class SettingsPage(QWidget):
                     btn_auto.clicked.connect(lambda _, r=row: self.detect_coord_auto(r))
             
             # Обновляем кнопку Del
-            del_btn = self.coords_table.cellWidget(row, 5)
+            del_btn = get_inner_widget(self.coords_table.cellWidget(row, 5))
             if del_btn:
                 try: del_btn.clicked.disconnect()
                 except: pass
@@ -2725,6 +3108,12 @@ class SettingsPage(QWidget):
         curr_item = self.maps_list_widget.currentItem()
         if curr_item and curr_item.text() == self.map_recorder.map_name:
             self.on_map_selected()
+
+    def on_map_preview_image_updated(self, qimg):
+        curr_item = self.maps_list_widget.currentItem()
+        if curr_item and curr_item.text() == self.map_recorder.map_name:
+            pixmap = QPixmap.fromImage(qimg)
+            self.map_preview_label.setPixmap(pixmap)
 
     def start_picking(self, row):
         self.current_picking_row = row
@@ -2745,10 +3134,18 @@ class SettingsPage(QWidget):
             key = f"coords_list_{self.current_coords_tab}"
             self.settings_obj.setValue(key, json.dumps(self.coords_list))
             
+            # Обновляем виджет координат
+            wrapper = self.coords_table.cellWidget(row, 1)
+            coord_widget = get_inner_widget(wrapper)
+            if isinstance(coord_widget, CoordCellWidget):
+                coord_widget.set_values(x, y)
+            
             # Обновляем UI ячейки
             coord_cell = self.coords_table.item(row, 1)
             if coord_cell:
+                self.coords_table.blockSignals(True)
                 coord_cell.setText(f"X: {x}, Y: {y}")
+                self.coords_table.blockSignals(False)
             
             if self.test_overlay and self.test_overlay.isVisible():
                 self.test_overlay.update_targets(self.coords_list)

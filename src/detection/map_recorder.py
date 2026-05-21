@@ -4,7 +4,9 @@ import numpy as np
 import mss
 import json
 import time
+import io
 from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication
 from PIL import Image, ImageDraw
 
@@ -12,6 +14,7 @@ ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "assets")
 
 class MapRecorder(QThread):
     preview_updated = pyqtSignal(str) # Путь к обновленному файлу карты
+    preview_image_updated = pyqtSignal(QImage) # Новое: сигнал с готовым QImage для real-time превью в памяти
     
     def __init__(self, settings_obj):
         super().__init__()
@@ -121,6 +124,12 @@ class MapRecorder(QThread):
             
             radius = self.brush_radius
             
+            # Настройки real-time обновления превью и слежения
+            last_preview_time = 0.0
+            last_known_pos = None
+            hero_matched_now = False
+            consecutive_lost_frames = 0
+            
             while self.is_running:
                 try:
                     sct_img = sct.grab(phys_region)
@@ -134,14 +143,17 @@ class MapRecorder(QThread):
                     
                     _, max_val, _, max_loc = cv2.minMaxLoc(result)
                     
+                    hero_matched_now = False
                     if max_val >= self.threshold:
+                        hero_matched_now = True
+                        consecutive_lost_frames = 0
                         phys_region_x = int(self.region["left"] * scale)
                         phys_region_y = int(self.region["top"] * scale)
                         marker_h_phys, marker_w_phys = self.marker_template.shape[:2]
                         
                         if self.centering_enabled:
-                            found_x_phys = max_loc[0] + (self.centering_offset[0] * scale)
-                            found_y_phys = max_loc[1] + (self.centering_offset[1] * scale)
+                            found_x_phys = max_loc[0] + self.centering_offset[0]
+                            found_y_phys = max_loc[1] + self.centering_offset[1]
                         else:
                             found_x_phys = max_loc[0] + marker_w_phys / 2
                             found_y_phys = max_loc[1] + marker_h_phys / 2
@@ -150,6 +162,7 @@ class MapRecorder(QThread):
                         global_y_phys = int(phys_region_y + found_y_phys)
                         
                         current_pos = (global_x_phys, global_y_phys)
+                        last_known_pos = current_pos
                         paint_color = "black" if self.is_reverse else "white"
 
                         try:
@@ -174,10 +187,73 @@ class MapRecorder(QThread):
                         except Exception: pass
                         
                         self.last_pos = current_pos
-                        self.walkability_img.save(self.walkability_path)
-                        self.preview_updated.emit(os.path.abspath(self.walkability_path))
+                    else:
+                        consecutive_lost_frames += 1
+                        # Если герой потерян более чем на 5 кадров (~50мс при 10мс интервале),
+                        # сбрасываем last_pos, чтобы избежать рисования диагональных линий-пролагов.
+                        if consecutive_lost_frames > 5:
+                            self.last_pos = None
+
+                    # Обновляем превью в памяти (без дискового I/O) с частотой ~10 FPS
+                    current_time = time.time()
+                    if current_time - last_preview_time >= 0.1:
+                        last_preview_time = current_time
+                        try:
+                            rx = reg_data.get("x", 0)
+                            ry = reg_data.get("y", 0)
+                            rw = reg_data.get("w", 0)
+                            rh = reg_data.get("h", 0)
+                            
+                            px = int(rx * scale)
+                            py = int(ry * scale)
+                            pw = int(rw * scale)
+                            ph = int(rh * scale)
+                            
+                            y2 = min(self.walkability_img.height, py + ph)
+                            x2 = min(self.walkability_img.width, px + pw)
+                            
+                            if px < self.walkability_img.width and py < self.walkability_img.height:
+                                cropped = self.walkability_img.crop((px, py, x2, y2))
+                                
+                                # Создаем временную копию для наложения маркера
+                                preview_img = cropped.copy()
+                                if last_known_pos is not None:
+                                    hero_x = last_known_pos[0] - px
+                                    hero_y = last_known_pos[1] - py
+                                    
+                                    # Отрисовываем положение героя только если оно попадает в границы кропа
+                                    if 0 <= hero_x < (x2 - px) and 0 <= hero_y < (y2 - py):
+                                        draw_preview = ImageDraw.Draw(preview_img)
+                                        r_dot = int(5 * scale)
+                                        # Цвет: Яркий красный если найден сейчас, или оранжевый если потерян
+                                        dot_color = (255, 0, 0) if hero_matched_now else (255, 165, 0)
+                                        draw_preview.ellipse(
+                                            (hero_x - r_dot, hero_y - r_dot, hero_x + r_dot, hero_y + r_dot),
+                                            fill=dot_color,
+                                            outline="white" if hero_matched_now else "gray"
+                                        )
+                                
+                                preview_img.thumbnail((300, 300))
+                                preview_rgb = preview_img.convert("RGB")
+                                
+                                # Сверхбезопасная конвертация через BMP в памяти
+                                byte_io = io.BytesIO()
+                                preview_rgb.save(byte_io, format="BMP")
+                                qimg = QImage.fromData(byte_io.getvalue())
+                                if not qimg.isNull():
+                                    self.preview_image_updated.emit(qimg)
+                        except Exception as e:
+                            print(f"Ошибка периодического обновления превью: {e}")
                         
                 except Exception as e:
                     print(f"Ошибка записи карты: {e}")
                     
                 self.msleep(self.interval_ms)
+
+            # Финальное сохранение при остановке записи
+            try:
+                self.walkability_img.save(self.walkability_path)
+                self.preview_updated.emit(os.path.abspath(self.walkability_path))
+                print("DEBUG: Финальное сохранение карты выполнено.")
+            except Exception as e:
+                print(f"Ошибка финального сохранения карты: {e}")
